@@ -6,26 +6,36 @@ Launch:
     python -m obsidian_to_anki.gui
 """
 
+import os
 import subprocess
 import sys
 import traceback
 from pathlib import Path
 
+# Work around Wayland protocol errors on WSL2 (Qt6 defaults to Wayland
+# via WSLg, which triggers buffer-size mismatches with the compositor).
+if "microsoft" in os.uname().release.lower():
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
 try:
-    from PySide6.QtCore import QThread, Signal, QObject, Qt, QUrl, QTimer
-    from PySide6.QtGui import QDesktopServices, QFont, QTextCursor
+    from PySide6.QtCore import QThread, Signal, QObject, Qt, QUrl, QTimer, QElapsedTimer
+    from PySide6.QtGui import QDesktopServices, QFont, QTextCursor, QColor, QBrush
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
         QFileDialog,
+        QFrame,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
         QLabel,
         QLineEdit,
         QMainWindow,
+        QProgressBar,
         QPushButton,
         QRadioButton,
+        QSizePolicy,
+        QSplitter,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
@@ -67,6 +77,18 @@ STEP_COLORS = {
     "error":   "color: #F44336;",
     "skip":    "color: gray;",
 }
+
+STEP_BG_COLORS = {
+    "pending": "",
+    "running": "background-color: #E3F2FD; border-radius: 4px;",
+    "done":    "background-color: #E8F5E9; border-radius: 4px;",
+    "error":   "background-color: #FFEBEE; border-radius: 4px;",
+    "skip":    "",
+}
+
+ROW_COLOR_SUCCESS = QColor("#E8F5E9")
+ROW_COLOR_ERROR   = QColor("#FFEBEE")
+ROW_COLOR_NEUTRAL = QColor("#F5F5F5")
 
 
 # ---------------------------------------------------------------------------
@@ -281,22 +303,30 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Obsidian \u2192 Anki v{__version__}")
-        self.resize(720, 620)
+        self.resize(900, 700)
 
         self._worker: ConvertWorker | SyncWorker | None = None
         self._redirector = StdoutRedirector()
         self._redirector.text_written.connect(self._append_details)
         self._is_batch = False
         self._total_files = 0
+        self._files_done = 0
         self._current_file = ""
         self._viewing_file = ""
         self._file_steps: dict[str, dict[str, tuple[str, str]]] = {}
         self._single_output_dir = ""
         self._current_step_names: list[str] = EXPORT_STEP_NAMES
+        self._step_timers: dict[str, QElapsedTimer] = {}
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        main_layout = QVBoxLayout(central)
+
+        # ==================== INPUT ZONE ====================
+        input_zone = QWidget()
+        input_zone.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        input_lay = QVBoxLayout(input_zone)
+        input_lay.setContentsMargins(0, 0, 0, 0)
 
         # -- Input path -----------------------------------------------------
         grp_input = QGroupBox("Input Path")
@@ -310,7 +340,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.input_edit, 1)
         h.addWidget(btn_file)
         h.addWidget(btn_dir)
-        layout.addWidget(grp_input)
+        input_lay.addWidget(grp_input)
 
         # -- Mode toggle ----------------------------------------------------
         grp_mode = QGroupBox("Mode")
@@ -327,7 +357,7 @@ class MainWindow(QMainWindow):
         self.conn_status = QLabel("")
         self.conn_status.setStyleSheet("font-size: 12px;")
         mode_lay.addWidget(self.conn_status)
-        layout.addWidget(grp_mode)
+        input_lay.addWidget(grp_mode)
 
         # -- Anki media path (export mode) ----------------------------------
         self.grp_media = QGroupBox("Anki Media Path")
@@ -338,7 +368,7 @@ class MainWindow(QMainWindow):
         btn_media.clicked.connect(self._browse_media)
         h2.addWidget(self.media_edit, 1)
         h2.addWidget(btn_media)
-        layout.addWidget(self.grp_media)
+        input_lay.addWidget(self.grp_media)
 
         # Pre-fill from config
         cfg = config.load()
@@ -352,7 +382,7 @@ class MainWindow(QMainWindow):
         self.url_edit.setPlaceholderText("http://127.0.0.1:8765")
         self.url_edit.setText(cfg.get("ankiconnect_url", config.DEFAULT_ANKICONNECT_URL))
         h_url.addWidget(self.url_edit, 1)
-        layout.addWidget(self.grp_url)
+        input_lay.addWidget(self.grp_url)
         self.grp_url.hide()
 
         # -- Options --------------------------------------------------------
@@ -364,16 +394,47 @@ class MainWindow(QMainWindow):
         h3.addWidget(self.chk_recursive)
         h3.addWidget(self.chk_delete_orphans)
         h3.addStretch()
-        layout.addLayout(h3)
+        input_lay.addLayout(h3)
         self.chk_delete_orphans.hide()
 
         # -- Action button --------------------------------------------------
         self.btn_action = QPushButton("Convert")
         self.btn_action.setFixedHeight(36)
         self.btn_action.clicked.connect(self._start_action)
-        layout.addWidget(self.btn_action)
+        input_lay.addWidget(self.btn_action)
 
-        # -- Progress section (step checklist) ------------------------------
+        main_layout.addWidget(input_zone)
+
+        # ==================== SEPARATOR ====================
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        main_layout.addWidget(separator)
+
+        # ==================== OUTPUT ZONE ====================
+        output_zone = QWidget()
+        output_lay = QVBoxLayout(output_zone)
+        output_lay.setContentsMargins(0, 4, 0, 0)
+
+        # -- Batch progress bar ---------------------------------------------
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setFormat("Processing %v of %m files...")
+        self.batch_progress.setStyleSheet(
+            "QProgressBar {"
+            "  border: 1px solid #ccc;"
+            "  border-radius: 4px;"
+            "  text-align: center;"
+            "  height: 22px;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background-color: #4CAF50;"
+            "  border-radius: 3px;"
+            "}"
+        )
+        output_lay.addWidget(self.batch_progress)
+        self.batch_progress.hide()
+
+        # -- Progress section (enhanced step rows) --------------------------
         self.progress_section = QWidget()
         prog_lay = QVBoxLayout(self.progress_section)
         prog_lay.setContentsMargins(0, 8, 0, 0)
@@ -382,34 +443,72 @@ class MainWindow(QMainWindow):
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
         prog_lay.addWidget(self.progress_header)
 
-        # Create step rows for both modes (we'll show/hide as needed)
-        self.step_rows: dict[str, tuple[QLabel, QLabel, QLabel]] = {}
-        self._step_layouts: dict[str, QHBoxLayout] = {}
-        all_steps = set(EXPORT_STEP_NAMES) | set(SYNC_STEP_NAMES)
-        for name in list(EXPORT_STEP_NAMES) + [s for s in SYNC_STEP_NAMES if s not in EXPORT_STEP_NAMES]:
-            row_lay = QHBoxLayout()
+        # Create step rows for both modes (icon, name, detail, time, frame)
+        self.step_rows: dict[str, tuple[QLabel, QLabel, QLabel, QLabel, QFrame]] = {}
+        all_step_names = list(EXPORT_STEP_NAMES) + [
+            s for s in SYNC_STEP_NAMES if s not in EXPORT_STEP_NAMES
+        ]
+        for name in all_step_names:
+            frame = QFrame()
+            frame.setStyleSheet("padding: 2px 6px; border-radius: 4px;")
+            row_lay = QHBoxLayout(frame)
+            row_lay.setContentsMargins(6, 2, 6, 2)
+
             icon_lbl = QLabel(STEP_ICONS["pending"])
-            icon_lbl.setFixedWidth(20)
+            icon_font = icon_lbl.font()
+            icon_font.setPointSize(14)
+            icon_lbl.setFont(icon_font)
+            icon_lbl.setFixedWidth(24)
+
             name_lbl = QLabel(name)
+
             detail_lbl = QLabel("")
             detail_lbl.setStyleSheet("color: gray;")
+
+            time_lbl = QLabel("")
+            time_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            time_lbl.setFixedWidth(60)
+            time_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+
             row_lay.addWidget(icon_lbl)
             row_lay.addWidget(name_lbl)
             row_lay.addWidget(detail_lbl, 1)
-            prog_lay.addLayout(row_lay)
-            self.step_rows[name] = (icon_lbl, name_lbl, detail_lbl)
-            self._step_layouts[name] = row_lay
+            row_lay.addWidget(time_lbl)
 
-        layout.addWidget(self.progress_section)
+            prog_lay.addWidget(frame)
+            self.step_rows[name] = (icon_lbl, name_lbl, detail_lbl, time_lbl, frame)
+
+        output_lay.addWidget(self.progress_section)
         self.progress_section.hide()
 
         # -- Open folder button (single-file export mode) -------------------
         self.open_folder_btn = QPushButton("Open Output Folder")
         self.open_folder_btn.clicked.connect(self._open_single_folder)
-        layout.addWidget(self.open_folder_btn)
+        output_lay.addWidget(self.open_folder_btn)
         self.open_folder_btn.hide()
 
-        # -- Results table --------------------------------------------------
+        # -- Details toggle button (always visible once processing starts) --
+        details_header = QHBoxLayout()
+        self.details_btn = QPushButton("\u25B6 Details")
+        self.details_btn.setFlat(True)
+        self.details_btn.setStyleSheet("text-align: left; padding: 4px;")
+        self.details_btn.clicked.connect(self._toggle_details)
+        details_header.addWidget(self.details_btn)
+        details_header.addStretch()
+        self.copy_details_btn = QPushButton("Copy")
+        self.copy_details_btn.setFixedWidth(50)
+        self.copy_details_btn.clicked.connect(self._copy_details)
+        self.copy_details_btn.hide()
+        details_header.addWidget(self.copy_details_btn)
+        output_lay.addLayout(details_header)
+        self.details_btn.hide()
+
+        # -- Splitter: results (top) + details panel (bottom) ---------------
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Results section (top of splitter)
         self.results_section = QWidget()
         res_lay = QVBoxLayout(self.results_section)
         res_lay.setContentsMargins(0, 8, 0, 0)
@@ -423,37 +522,46 @@ class MainWindow(QMainWindow):
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setStyleSheet(
+            "QTableWidget {"
+            "  alternate-background-color: #FAFAFA;"
+            "  gridline-color: #E0E0E0;"
+            "}"
+            "QHeaderView::section {"
+            "  background-color: #F5F5F5;"
+            "  font-weight: bold;"
+            "  padding: 4px;"
+            "  border: 1px solid #E0E0E0;"
+            "}"
+        )
         self.results_table.cellClicked.connect(self._on_result_clicked)
         res_lay.addWidget(self.results_table)
 
-        layout.addWidget(self.results_section, 1)
-        self.results_section.hide()
+        self.splitter.addWidget(self.results_section)
 
-        # -- Details panel (collapsible) ------------------------------------
-        details_header = QHBoxLayout()
-        self.details_btn = QPushButton("\u25B6 Details")
-        self.details_btn.setFlat(True)
-        self.details_btn.setStyleSheet("text-align: left; padding: 4px;")
-        self.details_btn.clicked.connect(self._toggle_details)
-        details_header.addWidget(self.details_btn)
-        details_header.addStretch()
-        self.copy_details_btn = QPushButton("Copy")
-        self.copy_details_btn.setFixedWidth(50)
-        self.copy_details_btn.clicked.connect(self._copy_details)
-        self.copy_details_btn.hide()
-        details_header.addWidget(self.copy_details_btn)
-        layout.addLayout(details_header)
-        self.details_btn.hide()
+        # Details panel (bottom of splitter, resizable)
+        self.details_panel = QWidget()
+        det_lay = QVBoxLayout(self.details_panel)
+        det_lay.setContentsMargins(0, 0, 0, 0)
 
         self.details_area = QTextEdit()
         self.details_area.setReadOnly(True)
         self.details_area.setFont(QFont("Consolas", 9))
-        self.details_area.setFixedHeight(150)
-        layout.addWidget(self.details_area)
-        self.details_area.hide()
+        det_lay.addWidget(self.details_area)
 
-        # Push everything up when hidden sections aren't visible
-        layout.addStretch()
+        self.splitter.addWidget(self.details_panel)
+
+        # Initial splitter proportions (70/30)
+        self.splitter.setStretchFactor(0, 7)
+        self.splitter.setStretchFactor(1, 3)
+
+        output_lay.addWidget(self.splitter, 1)
+
+        self.results_section.hide()
+        self.details_panel.hide()
+
+        main_layout.addWidget(output_zone, 1)
 
         # Initial mode setup
         self._on_mode_changed()
@@ -470,11 +578,9 @@ class MainWindow(QMainWindow):
         # Update step visibility
         self._current_step_names = SYNC_STEP_NAMES if is_sync else EXPORT_STEP_NAMES
         for name in self.step_rows:
-            icon_lbl, name_lbl, detail_lbl = self.step_rows[name]
+            _icon_lbl, _name_lbl, _detail_lbl, _time_lbl, frame = self.step_rows[name]
             visible = name in self._current_step_names
-            icon_lbl.setVisible(visible)
-            name_lbl.setVisible(visible)
-            detail_lbl.setVisible(visible)
+            frame.setVisible(visible)
 
         # Check connection when switching to sync mode
         if is_sync:
@@ -617,6 +723,7 @@ class MainWindow(QMainWindow):
     def _reset_ui_state(self):
         self._is_batch = False
         self._total_files = 0
+        self._files_done = 0
         self._current_file = ""
         self._viewing_file = ""
         self._file_steps.clear()
@@ -625,10 +732,12 @@ class MainWindow(QMainWindow):
         self.details_area.clear()
         self.results_table.setRowCount(0)
         self.results_section.hide()
+        self.details_panel.hide()
         self._reset_steps()
         self.progress_section.hide()
+        self.batch_progress.hide()
+        self.batch_progress.setValue(0)
         self.details_btn.show()
-        self.details_area.hide()
         self.copy_details_btn.hide()
         self.details_btn.setText("\u25B6 Details")
         self.btn_action.setEnabled(False)
@@ -642,10 +751,13 @@ class MainWindow(QMainWindow):
     def _reset_steps(self):
         for name in self._current_step_names:
             if name in self.step_rows:
-                icon_lbl, _name_lbl, detail_lbl = self.step_rows[name]
+                icon_lbl, _name_lbl, detail_lbl, time_lbl, frame = self.step_rows[name]
                 icon_lbl.setText(STEP_ICONS["pending"])
                 icon_lbl.setStyleSheet("")
                 detail_lbl.setText("")
+                time_lbl.setText("")
+                frame.setStyleSheet("padding: 2px 6px; border-radius: 4px;")
+        self._step_timers.clear()
 
     def _restore_stdout(self):
         sys.stdout = self._old_stdout
@@ -662,6 +774,10 @@ class MainWindow(QMainWindow):
         self.progress_section.show()
         if self._is_batch:
             self.progress_header.setText(f"Processing: {filename}    ({index}/{total})")
+            # Show and update batch progress bar
+            self.batch_progress.setMaximum(total)
+            self.batch_progress.setValue(index - 1)
+            self.batch_progress.show()
         else:
             self.progress_header.setText(f"Processing: {filename}")
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
@@ -670,11 +786,9 @@ class MainWindow(QMainWindow):
 
         # Update step visibility for current mode
         for name in self.step_rows:
-            icon_lbl, name_lbl, detail_lbl = self.step_rows[name]
+            _icon_lbl, _name_lbl, _detail_lbl, _time_lbl, frame = self.step_rows[name]
             visible = name in self._current_step_names
-            icon_lbl.setVisible(visible)
-            name_lbl.setVisible(visible)
-            detail_lbl.setVisible(visible)
+            frame.setVisible(visible)
 
         # Show real output filenames in step labels (export mode)
         if not self.radio_sync.isChecked():
@@ -688,13 +802,36 @@ class MainWindow(QMainWindow):
             self.results_section.show()
 
     def _set_step_display(self, step_name: str, status: str, detail: str):
-        """Update the icon, colour, and detail label for a single step row."""
+        """Update the icon, colour, background, and detail label for a single step row."""
         if step_name not in self.step_rows:
             return
-        icon_lbl, _name_lbl, detail_lbl = self.step_rows[step_name]
+        icon_lbl, _name_lbl, detail_lbl, time_lbl, frame = self.step_rows[step_name]
         icon_lbl.setText(STEP_ICONS.get(status, STEP_ICONS["pending"]))
         icon_lbl.setStyleSheet(STEP_COLORS.get(status, ""))
         detail_lbl.setText(detail)
+
+        # Background color
+        bg = STEP_BG_COLORS.get(status, "")
+        frame.setStyleSheet(f"padding: 2px 6px; {bg}")
+
+        # Timer management
+        if status == "running":
+            timer = QElapsedTimer()
+            timer.start()
+            self._step_timers[step_name] = timer
+            time_lbl.setText("")
+        elif status in ("done", "error"):
+            timer = self._step_timers.pop(step_name, None)
+            if timer:
+                elapsed_ms = timer.elapsed()
+                if elapsed_ms >= 1000:
+                    time_lbl.setText(f"{elapsed_ms / 1000:.1f}s")
+                else:
+                    time_lbl.setText(f"{elapsed_ms}ms")
+            else:
+                time_lbl.setText("")
+        else:
+            time_lbl.setText("")
 
     def _on_step_update(self, step_name: str, status: str, detail: str):
         if step_name not in self.step_rows:
@@ -712,6 +849,8 @@ class MainWindow(QMainWindow):
 
     def _on_export_file_done(self, filename: str, basic_count: int, cloze_count: int,
                               ok: bool, output_dir: str):
+        self._files_done += 1
+
         if not self._is_batch:
             self._single_output_dir = output_dir
             return
@@ -725,10 +864,13 @@ class MainWindow(QMainWindow):
 
         if not ok:
             status_text = "\u2717 Error"
+            color = ROW_COLOR_ERROR
         elif basic_count == 0 and cloze_count == 0:
             status_text = "\u2014 No cards"
+            color = ROW_COLOR_NEUTRAL
         else:
             status_text = "\u2713 Exported"
+            color = ROW_COLOR_SUCCESS
         self.results_table.setItem(row, 3, QTableWidgetItem(status_text))
 
         if output_dir:
@@ -737,6 +879,11 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _checked, p=output_dir: self._open_folder(p))
             self.results_table.setCellWidget(row, 4, btn)
 
+        self._color_result_row(row, color)
+
+        # Update batch progress
+        self.batch_progress.setValue(self._files_done)
+
         done = row + 1
         self.results_header.setText(f"Results    {done}/{self._total_files} files")
 
@@ -744,6 +891,8 @@ class MainWindow(QMainWindow):
 
     def _on_sync_file_done(self, filename: str, new_count: int, updated_count: int,
                             unchanged_count: int, deleted_count: int, ok: bool):
+        self._files_done += 1
+
         if not self._is_batch:
             return
 
@@ -758,11 +907,19 @@ class MainWindow(QMainWindow):
 
         if not ok:
             status_text = "\u2717 Error"
+            color = ROW_COLOR_ERROR
         elif new_count == 0 and updated_count == 0:
             status_text = "\u2713 Up to date"
+            color = ROW_COLOR_NEUTRAL
         else:
             status_text = "\u2713 Synced"
+            color = ROW_COLOR_SUCCESS
         self.results_table.setItem(row, 5, QTableWidgetItem(status_text))
+
+        self._color_result_row(row, color)
+
+        # Update batch progress
+        self.batch_progress.setValue(self._files_done)
 
         done = row + 1
         self.results_header.setText(f"Results    {done}/{self._total_files} files")
@@ -777,16 +934,24 @@ class MainWindow(QMainWindow):
             self.progress_header.setText("No .md files found")
             self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
         elif self._is_batch:
-            total = self.results_table.rowCount()
+            self._add_summary_row()
+            # Count successes (skip TOTAL row)
+            status_col = 5 if self.radio_sync.isChecked() else 3
             ok_count = 0
-            for row in range(total):
-                last_col = self.results_table.columnCount() - 1
-                item = self.results_table.item(row, last_col)
-                if item and "\u2713" in item.text():
+            for row in range(self.results_table.rowCount()):
+                name_item = self.results_table.item(row, 0)
+                if name_item and name_item.text() == "TOTAL":
+                    continue
+                status_item = self.results_table.item(row, status_col)
+                if status_item and "\u2713" in status_item.text():
                     ok_count += 1
+            total = self._total_files
             action = "synced" if self.radio_sync.isChecked() else "exported"
             self.progress_header.setText(f"\u2713 Done \u2014 {ok_count}/{total} files {action}")
             self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #4CAF50;")
+            # Finalize progress bar
+            self.batch_progress.setValue(self.batch_progress.maximum())
+            self.batch_progress.setFormat("Done \u2014 %v files processed")
         else:
             action = "Sync" if self.radio_sync.isChecked() else "Export"
             self.progress_header.setText(f"\u2713 {action} complete")
@@ -803,8 +968,8 @@ class MainWindow(QMainWindow):
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #F44336;")
         self.btn_action.setEnabled(True)
         # Auto-expand details so the user can see the full traceback
-        if not self.details_area.isVisible():
-            self.details_area.show()
+        if not self.details_panel.isVisible():
+            self.details_panel.show()
             self.copy_details_btn.show()
             self.details_btn.setText("\u25BC Details")
 
@@ -815,6 +980,9 @@ class MainWindow(QMainWindow):
         if not item:
             return
         filename = item.text()
+        # Guard against TOTAL row
+        if filename == "TOTAL":
+            return
         self._viewing_file = filename
         self._load_file_steps(filename)
 
@@ -831,6 +999,71 @@ class MainWindow(QMainWindow):
                 self.step_rows["Generate Cloze.txt"][1].setText(f"Generate {stem} - Cloze.txt")
         self.progress_header.setText(f"Steps: {filename}")
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
+
+    # -- color helpers ------------------------------------------------------
+
+    def _color_result_row(self, row: int, color: QColor):
+        """Set the background color for all cells in a results table row."""
+        brush = QBrush(color)
+        for col in range(self.results_table.columnCount()):
+            item = self.results_table.item(row, col)
+            if item:
+                item.setBackground(brush)
+
+    def _add_summary_row(self):
+        """Insert a bold TOTAL row with summed counts at the bottom of the results table."""
+        row_count = self.results_table.rowCount()
+        if row_count == 0:
+            return
+
+        col_count = self.results_table.columnCount()
+        self.results_table.insertRow(row_count)
+
+        # Determine which columns are numeric
+        is_sync = self.radio_sync.isChecked()
+        if is_sync:
+            # Columns: File(0), New(1), Updated(2), Unchanged(3), Deleted(4), Status(5)
+            num_cols = range(1, 5)
+        else:
+            # Columns: File(0), Basic(1), Cloze(2), Status(3), OpenBtn(4)
+            num_cols = range(1, 3)
+
+        totals = {}
+        for col in num_cols:
+            total = 0
+            for row in range(row_count):
+                item = self.results_table.item(row, col)
+                if item:
+                    try:
+                        total += int(item.text())
+                    except ValueError:
+                        pass
+            totals[col] = total
+
+        # Create TOTAL row with bold font and gray background
+        bold_font = QFont()
+        bold_font.setBold(True)
+        gray_bg = QBrush(QColor("#E0E0E0"))
+
+        total_item = QTableWidgetItem("TOTAL")
+        total_item.setFont(bold_font)
+        total_item.setBackground(gray_bg)
+        self.results_table.setItem(row_count, 0, total_item)
+
+        for col in num_cols:
+            item = QTableWidgetItem(str(totals[col]))
+            item.setFont(bold_font)
+            item.setBackground(gray_bg)
+            self.results_table.setItem(row_count, col, item)
+
+        # Fill remaining columns with styled empty cells
+        filled_cols = {0} | set(num_cols)
+        for col in range(col_count):
+            if col not in filled_cols:
+                item = QTableWidgetItem("")
+                item.setFont(bold_font)
+                item.setBackground(gray_bg)
+                self.results_table.setItem(row_count, col, item)
 
     # -- open folder --------------------------------------------------------
 
@@ -850,12 +1083,12 @@ class MainWindow(QMainWindow):
     # -- details panel ------------------------------------------------------
 
     def _toggle_details(self):
-        if self.details_area.isVisible():
-            self.details_area.hide()
+        if self.details_panel.isVisible():
+            self.details_panel.hide()
             self.copy_details_btn.hide()
             self.details_btn.setText("\u25B6 Details")
         else:
-            self.details_area.show()
+            self.details_panel.show()
             self.copy_details_btn.show()
             self.details_btn.setText("\u25BC Details")
 
