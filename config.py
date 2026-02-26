@@ -75,6 +75,35 @@ def get_anki_media_path(cli_override: str = None) -> str:
     return path
 
 
+DEFAULT_ANKICONNECT_URL = "http://127.0.0.1:8765"
+
+
+def get_ankiconnect_url(cli_override: str = None) -> str:
+    """
+    Get the AnkiConnect endpoint URL.
+
+    Priority:
+    1. CLI argument (--ankiconnect-url)
+    2. Saved config
+    3. Default: http://127.0.0.1:8765
+    """
+    config = load()
+
+    if cli_override:
+        config["ankiconnect_url"] = cli_override
+        save(config)
+        print(f"[config] AnkiConnect URL set via CLI: {cli_override}")
+        return cli_override
+
+    if "ankiconnect_url" in config:
+        url = config["ankiconnect_url"]
+        print(f"[config] Loaded AnkiConnect URL: {url}")
+        return url
+
+    print(f"[config] Using default AnkiConnect URL: {DEFAULT_ANKICONNECT_URL}")
+    return DEFAULT_ANKICONNECT_URL
+
+
 # ---------------------------------------------------------------------------
 # Shared folder-discovery helpers
 # ---------------------------------------------------------------------------

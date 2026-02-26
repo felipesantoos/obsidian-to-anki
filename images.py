@@ -117,7 +117,10 @@ def copy_to_anki(
         img_path = resolve_path(img_ref, md_file_path, vault_root)
         if img_path:
             dest = anki_media / img_path.name
-            if dry_run:
+            if dest.resolve() == img_path.resolve():
+                print(f"[images]   Skipped (already in media folder): {img_path.name}")
+                skipped += 1
+            elif dry_run:
                 print(f"[images]   [DRY RUN] Would copy: {img_path.name} → {dest}")
                 skipped += 1
             else:

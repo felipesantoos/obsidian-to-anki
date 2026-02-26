@@ -8,10 +8,11 @@ Launch:
 
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QThread, Signal, QObject, Qt, QUrl
+    from PySide6.QtCore import QThread, Signal, QObject, Qt, QUrl, QTimer
     from PySide6.QtGui import QDesktopServices, QFont, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
@@ -24,6 +25,7 @@ try:
         QLineEdit,
         QMainWindow,
         QPushButton,
+        QRadioButton,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
@@ -47,7 +49,8 @@ from . import config
 # Constants
 # ---------------------------------------------------------------------------
 
-STEP_NAMES = ["Parse note", "Copy images", "Generate Basic.txt", "Generate Cloze.txt"]
+EXPORT_STEP_NAMES = ["Parse note", "Copy images", "Generate Basic.txt", "Generate Cloze.txt"]
+SYNC_STEP_NAMES = ["Parse", "Connect", "Analyze", "Sync", "Write IDs"]
 
 STEP_ICONS = {
     "pending": "\u25CB",   # ○
@@ -87,7 +90,7 @@ class StdoutRedirector(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Worker thread
+# Export worker thread
 # ---------------------------------------------------------------------------
 
 class ConvertWorker(QThread):
@@ -143,7 +146,7 @@ class ConvertWorker(QThread):
             try:
                 self._run_single(md_file, i, len(md_files))
             except Exception as e:
-                print(f"[error] {md_file.name}: {e}")
+                print(f"[error] {md_file.name}: {e}\n{traceback.format_exc()}")
                 self.file_done.emit(md_file.name, 0, 0, False, "")
 
     # -- entry point ---------------------------------------------------------
@@ -160,7 +163,114 @@ class ConvertWorker(QThread):
                 return
             self.finished_ok.emit()
         except Exception as e:
+            print(f"[error] {traceback.format_exc()}")
+            self.finished_err.emit(f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Sync worker thread
+# ---------------------------------------------------------------------------
+
+class SyncWorker(QThread):
+    """Runs sync pipeline off the main thread."""
+
+    file_started = Signal(str, int, int)       # filename, index, total
+    step_update  = Signal(str, str, str)       # step_name, status, detail
+    file_done    = Signal(str, int, int, int, int, bool)  # filename, new, updated, unchanged, deleted, ok
+    finished_ok  = Signal()
+    finished_err = Signal(str)
+
+    def __init__(self, path: str, url: str, dry_run: bool, recursive: bool, delete_orphans: bool):
+        super().__init__()
+        self.path = path
+        self.url = url
+        self.dry_run = dry_run
+        self.recursive = recursive
+        self.delete_orphans = delete_orphans
+
+    def _run_single(self, file_path: Path, index: int, total: int):
+        from .ankiconnect import AnkiConnectClient
+        from .sync import sync_note
+
+        filename = file_path.name
+        self.file_started.emit(filename, index, total)
+
+        try:
+            note = parse_note(file_path)
+        except Exception as e:
+            print(f"[error] Parse failed for {filename}:\n{traceback.format_exc()}")
+            self.step_update.emit("Parse", "error", str(e))
+            self.file_done.emit(filename, 0, 0, 0, 0, False)
+            return
+
+        client = AnkiConnectClient(self.url)
+        try:
+            result = sync_note(
+                note, client,
+                dry_run=self.dry_run,
+                delete_orphans=self.delete_orphans,
+                on_step=self.step_update.emit,
+            )
+        except Exception as e:
+            print(f"[error] Sync failed for {filename}:\n{traceback.format_exc()}")
+            self.step_update.emit("Sync", "error", str(e))
+            self.file_done.emit(filename, 0, 0, 0, 0, False)
+            return
+
+        ok = result.error_count == 0
+        self.file_done.emit(
+            filename,
+            result.new_count,
+            result.updated_count,
+            result.unchanged_count,
+            result.deleted_from_obsidian,
+            ok,
+        )
+
+    def _run_batch(self, folder: Path):
+        md_files = config.discover_md_files(folder, self.recursive)
+
+        if not md_files:
+            print(f"[batch] No .md files found in: {folder}")
+            return
+
+        print(f"[batch] Found {len(md_files)} file(s) to sync\n")
+
+        for i, md_file in enumerate(md_files, 1):
+            try:
+                self._run_single(md_file, i, len(md_files))
+            except Exception as e:
+                print(f"[error] {md_file.name}:\n{traceback.format_exc()}")
+                self.file_done.emit(md_file.name, 0, 0, 0, 0, False)
+
+    def run(self):
+        from .ankiconnect import AnkiConnectClient, AnkiConnectError
+
+        try:
+            # Pre-check connection
+            client = AnkiConnectClient(self.url)
+            if not client.ping():
+                self.finished_err.emit(
+                    f"Cannot reach AnkiConnect at {self.url}. "
+                    "Is Anki running with AnkiConnect installed?"
+                )
+                return
+
+            target = Path(self.path).resolve()
+            if target.is_dir():
+                self._run_batch(target)
+            elif target.is_file():
+                self._run_single(target, 1, 1)
+            else:
+                self.finished_err.emit(f"'{self.path}' is not a valid file or folder.")
+                return
+            self.finished_ok.emit()
+        except AnkiConnectError as e:
+            print(f"[error] {traceback.format_exc()}")
             self.finished_err.emit(str(e))
+        except Exception as e:
+            print(f"[error] {traceback.format_exc()}")
+            self.finished_err.emit(f"{type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -170,18 +280,19 @@ class ConvertWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Obsidian \u2192 Anki Exporter v{__version__}")
-        self.resize(700, 580)
+        self.setWindowTitle(f"Obsidian \u2192 Anki v{__version__}")
+        self.resize(720, 620)
 
-        self._worker: ConvertWorker | None = None
+        self._worker: ConvertWorker | SyncWorker | None = None
         self._redirector = StdoutRedirector()
         self._redirector.text_written.connect(self._append_details)
         self._is_batch = False
         self._total_files = 0
-        self._current_file = ""          # file being processed right now
-        self._viewing_file = ""           # file whose steps are displayed
-        self._file_steps: dict[str, dict[str, tuple[str, str]]] = {}  # stored per-file step data
+        self._current_file = ""
+        self._viewing_file = ""
+        self._file_steps: dict[str, dict[str, tuple[str, str]]] = {}
         self._single_output_dir = ""
+        self._current_step_names: list[str] = EXPORT_STEP_NAMES
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -201,36 +312,66 @@ class MainWindow(QMainWindow):
         h.addWidget(btn_dir)
         layout.addWidget(grp_input)
 
-        # -- Anki media path ------------------------------------------------
-        grp_media = QGroupBox("Anki Media Path")
-        h2 = QHBoxLayout(grp_media)
+        # -- Mode toggle ----------------------------------------------------
+        grp_mode = QGroupBox("Mode")
+        mode_lay = QHBoxLayout(grp_mode)
+        self.radio_export = QRadioButton("Export TSV")
+        self.radio_sync = QRadioButton("Sync to Anki")
+        self.radio_export.setChecked(True)
+        self.radio_export.toggled.connect(self._on_mode_changed)
+        mode_lay.addWidget(self.radio_export)
+        mode_lay.addWidget(self.radio_sync)
+        mode_lay.addStretch()
+
+        # Connection status indicator
+        self.conn_status = QLabel("")
+        self.conn_status.setStyleSheet("font-size: 12px;")
+        mode_lay.addWidget(self.conn_status)
+        layout.addWidget(grp_mode)
+
+        # -- Anki media path (export mode) ----------------------------------
+        self.grp_media = QGroupBox("Anki Media Path")
+        h2 = QHBoxLayout(self.grp_media)
         self.media_edit = QLineEdit()
         self.media_edit.setPlaceholderText("Path to Anki's collection.media folder")
         btn_media = QPushButton("Browse\u2026")
         btn_media.clicked.connect(self._browse_media)
         h2.addWidget(self.media_edit, 1)
         h2.addWidget(btn_media)
-        layout.addWidget(grp_media)
+        layout.addWidget(self.grp_media)
 
         # Pre-fill from config
         cfg = config.load()
         if "anki_media_path" in cfg:
             self.media_edit.setText(cfg["anki_media_path"])
 
+        # -- AnkiConnect URL (sync mode) ------------------------------------
+        self.grp_url = QGroupBox("AnkiConnect URL")
+        h_url = QHBoxLayout(self.grp_url)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("http://127.0.0.1:8765")
+        self.url_edit.setText(cfg.get("ankiconnect_url", config.DEFAULT_ANKICONNECT_URL))
+        h_url.addWidget(self.url_edit, 1)
+        layout.addWidget(self.grp_url)
+        self.grp_url.hide()
+
         # -- Options --------------------------------------------------------
         h3 = QHBoxLayout()
         self.chk_dry = QCheckBox("Dry run")
         self.chk_recursive = QCheckBox("Recursive")
+        self.chk_delete_orphans = QCheckBox("Delete orphans")
         h3.addWidget(self.chk_dry)
         h3.addWidget(self.chk_recursive)
+        h3.addWidget(self.chk_delete_orphans)
         h3.addStretch()
         layout.addLayout(h3)
+        self.chk_delete_orphans.hide()
 
-        # -- Convert button -------------------------------------------------
-        self.btn_convert = QPushButton("Convert")
-        self.btn_convert.setFixedHeight(36)
-        self.btn_convert.clicked.connect(self._start_convert)
-        layout.addWidget(self.btn_convert)
+        # -- Action button --------------------------------------------------
+        self.btn_action = QPushButton("Convert")
+        self.btn_action.setFixedHeight(36)
+        self.btn_action.clicked.connect(self._start_action)
+        layout.addWidget(self.btn_action)
 
         # -- Progress section (step checklist) ------------------------------
         self.progress_section = QWidget()
@@ -241,8 +382,11 @@ class MainWindow(QMainWindow):
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
         prog_lay.addWidget(self.progress_header)
 
+        # Create step rows for both modes (we'll show/hide as needed)
         self.step_rows: dict[str, tuple[QLabel, QLabel, QLabel]] = {}
-        for name in STEP_NAMES:
+        self._step_layouts: dict[str, QHBoxLayout] = {}
+        all_steps = set(EXPORT_STEP_NAMES) | set(SYNC_STEP_NAMES)
+        for name in list(EXPORT_STEP_NAMES) + [s for s in SYNC_STEP_NAMES if s not in EXPORT_STEP_NAMES]:
             row_lay = QHBoxLayout()
             icon_lbl = QLabel(STEP_ICONS["pending"])
             icon_lbl.setFixedWidth(20)
@@ -254,11 +398,12 @@ class MainWindow(QMainWindow):
             row_lay.addWidget(detail_lbl, 1)
             prog_lay.addLayout(row_lay)
             self.step_rows[name] = (icon_lbl, name_lbl, detail_lbl)
+            self._step_layouts[name] = row_lay
 
         layout.addWidget(self.progress_section)
         self.progress_section.hide()
 
-        # -- Open folder button (single-file mode) -------------------------
+        # -- Open folder button (single-file export mode) -------------------
         self.open_folder_btn = QPushButton("Open Output Folder")
         self.open_folder_btn.clicked.connect(self._open_single_folder)
         layout.addWidget(self.open_folder_btn)
@@ -274,16 +419,10 @@ class MainWindow(QMainWindow):
         res_lay.addWidget(self.results_header)
 
         self.results_table = QTableWidget(0, 5)
-        self.results_table.setHorizontalHeaderLabels(["File", "Basic", "Cloze", "Status", ""])
+        self._update_results_columns_for_mode()
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.verticalHeader().setVisible(False)
-        header = self.results_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.results_table.cellClicked.connect(self._on_result_clicked)
         res_lay.addWidget(self.results_table)
 
@@ -291,11 +430,19 @@ class MainWindow(QMainWindow):
         self.results_section.hide()
 
         # -- Details panel (collapsible) ------------------------------------
+        details_header = QHBoxLayout()
         self.details_btn = QPushButton("\u25B6 Details")
         self.details_btn.setFlat(True)
         self.details_btn.setStyleSheet("text-align: left; padding: 4px;")
         self.details_btn.clicked.connect(self._toggle_details)
-        layout.addWidget(self.details_btn)
+        details_header.addWidget(self.details_btn)
+        details_header.addStretch()
+        self.copy_details_btn = QPushButton("Copy")
+        self.copy_details_btn.setFixedWidth(50)
+        self.copy_details_btn.clicked.connect(self._copy_details)
+        self.copy_details_btn.hide()
+        details_header.addWidget(self.copy_details_btn)
+        layout.addLayout(details_header)
         self.details_btn.hide()
 
         self.details_area = QTextEdit()
@@ -307,6 +454,67 @@ class MainWindow(QMainWindow):
 
         # Push everything up when hidden sections aren't visible
         layout.addStretch()
+
+        # Initial mode setup
+        self._on_mode_changed()
+
+    # -- mode switching -----------------------------------------------------
+
+    def _on_mode_changed(self):
+        is_sync = self.radio_sync.isChecked()
+        self.grp_media.setVisible(not is_sync)
+        self.grp_url.setVisible(is_sync)
+        self.chk_delete_orphans.setVisible(is_sync)
+        self.btn_action.setText("Sync" if is_sync else "Convert")
+
+        # Update step visibility
+        self._current_step_names = SYNC_STEP_NAMES if is_sync else EXPORT_STEP_NAMES
+        for name in self.step_rows:
+            icon_lbl, name_lbl, detail_lbl = self.step_rows[name]
+            visible = name in self._current_step_names
+            icon_lbl.setVisible(visible)
+            name_lbl.setVisible(visible)
+            detail_lbl.setVisible(visible)
+
+        # Check connection when switching to sync mode
+        if is_sync:
+            self._check_connection()
+        else:
+            self.conn_status.setText("")
+
+    def _check_connection(self):
+        """Check AnkiConnect connectivity in background."""
+        self.conn_status.setText("Checking...")
+        self.conn_status.setStyleSheet("font-size: 12px; color: gray;")
+        QTimer.singleShot(100, self._do_check_connection)
+
+    def _do_check_connection(self):
+        from .ankiconnect import AnkiConnectClient
+        url = self.url_edit.text().strip() or config.DEFAULT_ANKICONNECT_URL
+        client = AnkiConnectClient(url, timeout=3)
+        if client.ping():
+            self.conn_status.setText("\u2713 Connected")
+            self.conn_status.setStyleSheet("font-size: 12px; color: #4CAF50;")
+        else:
+            self.conn_status.setText("\u2717 Not connected")
+            self.conn_status.setStyleSheet("font-size: 12px; color: #F44336;")
+
+    def _update_results_columns_for_mode(self):
+        is_sync = self.radio_sync.isChecked()
+        if is_sync:
+            self.results_table.setColumnCount(6)
+            self.results_table.setHorizontalHeaderLabels(
+                ["File", "New", "Updated", "Unchanged", "Deleted", "Status"]
+            )
+        else:
+            self.results_table.setColumnCount(5)
+            self.results_table.setHorizontalHeaderLabels(
+                ["File", "Basic", "Cloze", "Status", ""]
+            )
+        header = self.results_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, self.results_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
 
     # -- browse helpers -----------------------------------------------------
 
@@ -327,7 +535,13 @@ class MainWindow(QMainWindow):
         if path:
             self.media_edit.setText(path)
 
-    # -- conversion ---------------------------------------------------------
+    # -- start action -------------------------------------------------------
+
+    def _start_action(self):
+        if self.radio_sync.isChecked():
+            self._start_sync()
+        else:
+            self._start_convert()
 
     def _start_convert(self):
         input_path = self.input_edit.text().strip()
@@ -346,7 +560,61 @@ class MainWindow(QMainWindow):
             cfg["anki_media_path"] = media_path
             config.save(cfg)
 
-        # Reset UI state
+        self._reset_ui_state()
+        self._current_step_names = EXPORT_STEP_NAMES
+
+        # Redirect stdout for the duration of the worker
+        self._old_stdout = sys.stdout
+        sys.stdout = self._redirector
+
+        self._worker = ConvertWorker(
+            input_path, media_path,
+            dry_run=self.chk_dry.isChecked(),
+            recursive=self.chk_recursive.isChecked(),
+        )
+        self._worker.file_started.connect(self._on_file_started)
+        self._worker.step_update.connect(self._on_step_update)
+        self._worker.file_done.connect(self._on_export_file_done)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.finished_err.connect(self._on_error)
+        self._worker.start()
+
+    def _start_sync(self):
+        input_path = self.input_edit.text().strip()
+        url = self.url_edit.text().strip() or config.DEFAULT_ANKICONNECT_URL
+
+        if not input_path:
+            self._show_validation_error("Please select an input file or folder.")
+            return
+
+        # Save URL to config
+        cfg = config.load()
+        if cfg.get("ankiconnect_url") != url:
+            cfg["ankiconnect_url"] = url
+            config.save(cfg)
+
+        self._reset_ui_state()
+        self._current_step_names = SYNC_STEP_NAMES
+        self._update_results_columns_for_mode()
+
+        # Redirect stdout
+        self._old_stdout = sys.stdout
+        sys.stdout = self._redirector
+
+        self._worker = SyncWorker(
+            input_path, url,
+            dry_run=self.chk_dry.isChecked(),
+            recursive=self.chk_recursive.isChecked(),
+            delete_orphans=self.chk_delete_orphans.isChecked(),
+        )
+        self._worker.file_started.connect(self._on_file_started)
+        self._worker.step_update.connect(self._on_step_update)
+        self._worker.file_done.connect(self._on_sync_file_done)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.finished_err.connect(self._on_error)
+        self._worker.start()
+
+    def _reset_ui_state(self):
         self._is_batch = False
         self._total_files = 0
         self._current_file = ""
@@ -361,24 +629,9 @@ class MainWindow(QMainWindow):
         self.progress_section.hide()
         self.details_btn.show()
         self.details_area.hide()
+        self.copy_details_btn.hide()
         self.details_btn.setText("\u25B6 Details")
-        self.btn_convert.setEnabled(False)
-
-        # Redirect stdout for the duration of the worker
-        self._old_stdout = sys.stdout
-        sys.stdout = self._redirector
-
-        self._worker = ConvertWorker(
-            input_path, media_path,
-            dry_run=self.chk_dry.isChecked(),
-            recursive=self.chk_recursive.isChecked(),
-        )
-        self._worker.file_started.connect(self._on_file_started)
-        self._worker.step_update.connect(self._on_step_update)
-        self._worker.file_done.connect(self._on_file_done)
-        self._worker.finished_ok.connect(self._on_done)
-        self._worker.finished_err.connect(self._on_error)
-        self._worker.start()
+        self.btn_action.setEnabled(False)
 
     def _show_validation_error(self, msg: str):
         self.progress_section.show()
@@ -387,23 +640,24 @@ class MainWindow(QMainWindow):
         self._reset_steps()
 
     def _reset_steps(self):
-        for name in STEP_NAMES:
-            icon_lbl, _name_lbl, detail_lbl = self.step_rows[name]
-            icon_lbl.setText(STEP_ICONS["pending"])
-            icon_lbl.setStyleSheet("")
-            detail_lbl.setText("")
+        for name in self._current_step_names:
+            if name in self.step_rows:
+                icon_lbl, _name_lbl, detail_lbl = self.step_rows[name]
+                icon_lbl.setText(STEP_ICONS["pending"])
+                icon_lbl.setStyleSheet("")
+                detail_lbl.setText("")
 
     def _restore_stdout(self):
         sys.stdout = self._old_stdout
 
-    # -- signal handlers ----------------------------------------------------
+    # -- signal handlers (shared) -------------------------------------------
 
     def _on_file_started(self, filename: str, index: int, total: int):
         self._total_files = total
         self._is_batch = total > 1
         self._current_file = filename
         self._viewing_file = filename
-        self._file_steps[filename] = {name: ("pending", "") for name in STEP_NAMES}
+        self._file_steps[filename] = {name: ("pending", "") for name in self._current_step_names}
 
         self.progress_section.show()
         if self._is_batch:
@@ -414,16 +668,29 @@ class MainWindow(QMainWindow):
 
         self._reset_steps()
 
-        # Show real output filenames in step labels
-        stem = Path(filename).stem
-        self.step_rows["Generate Basic.txt"][1].setText(f"Generate {stem} - Basic.txt")
-        self.step_rows["Generate Cloze.txt"][1].setText(f"Generate {stem} - Cloze.txt")
+        # Update step visibility for current mode
+        for name in self.step_rows:
+            icon_lbl, name_lbl, detail_lbl = self.step_rows[name]
+            visible = name in self._current_step_names
+            icon_lbl.setVisible(visible)
+            name_lbl.setVisible(visible)
+            detail_lbl.setVisible(visible)
+
+        # Show real output filenames in step labels (export mode)
+        if not self.radio_sync.isChecked():
+            stem = Path(filename).stem
+            if "Generate Basic.txt" in self.step_rows:
+                self.step_rows["Generate Basic.txt"][1].setText(f"Generate {stem} - Basic.txt")
+            if "Generate Cloze.txt" in self.step_rows:
+                self.step_rows["Generate Cloze.txt"][1].setText(f"Generate {stem} - Cloze.txt")
 
         if self._is_batch:
             self.results_section.show()
 
     def _set_step_display(self, step_name: str, status: str, detail: str):
         """Update the icon, colour, and detail label for a single step row."""
+        if step_name not in self.step_rows:
+            return
         icon_lbl, _name_lbl, detail_lbl = self.step_rows[step_name]
         icon_lbl.setText(STEP_ICONS.get(status, STEP_ICONS["pending"]))
         icon_lbl.setStyleSheet(STEP_COLORS.get(status, ""))
@@ -441,8 +708,10 @@ class MainWindow(QMainWindow):
         if self._viewing_file == self._current_file:
             self._set_step_display(step_name, status, detail)
 
-    def _on_file_done(self, filename: str, basic_count: int, cloze_count: int,
-                       ok: bool, output_dir: str):
+    # -- export file done ---------------------------------------------------
+
+    def _on_export_file_done(self, filename: str, basic_count: int, cloze_count: int,
+                              ok: bool, output_dir: str):
         if not self._is_batch:
             self._single_output_dir = output_dir
             return
@@ -471,37 +740,73 @@ class MainWindow(QMainWindow):
         done = row + 1
         self.results_header.setText(f"Results    {done}/{self._total_files} files")
 
+    # -- sync file done -----------------------------------------------------
+
+    def _on_sync_file_done(self, filename: str, new_count: int, updated_count: int,
+                            unchanged_count: int, deleted_count: int, ok: bool):
+        if not self._is_batch:
+            return
+
+        row = self.results_table.rowCount()
+        self.results_table.insertRow(row)
+
+        self.results_table.setItem(row, 0, QTableWidgetItem(filename))
+        self.results_table.setItem(row, 1, QTableWidgetItem(str(new_count)))
+        self.results_table.setItem(row, 2, QTableWidgetItem(str(updated_count)))
+        self.results_table.setItem(row, 3, QTableWidgetItem(str(unchanged_count)))
+        self.results_table.setItem(row, 4, QTableWidgetItem(str(deleted_count)))
+
+        if not ok:
+            status_text = "\u2717 Error"
+        elif new_count == 0 and updated_count == 0:
+            status_text = "\u2713 Up to date"
+        else:
+            status_text = "\u2713 Synced"
+        self.results_table.setItem(row, 5, QTableWidgetItem(status_text))
+
+        done = row + 1
+        self.results_header.setText(f"Results    {done}/{self._total_files} files")
+
+    # -- finished handlers --------------------------------------------------
+
     def _on_done(self):
         self._restore_stdout()
 
         if not self.progress_section.isVisible():
-            # No files were processed (e.g., empty folder)
             self.progress_section.show()
             self.progress_header.setText("No .md files found")
             self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
         elif self._is_batch:
-            exported = 0
-            for row in range(self.results_table.rowCount()):
-                item = self.results_table.item(row, 3)
-                if item and "\u2713" in item.text():
-                    exported += 1
             total = self.results_table.rowCount()
-            self.progress_header.setText(f"\u2713 Done \u2014 {exported}/{total} files exported")
+            ok_count = 0
+            for row in range(total):
+                last_col = self.results_table.columnCount() - 1
+                item = self.results_table.item(row, last_col)
+                if item and "\u2713" in item.text():
+                    ok_count += 1
+            action = "synced" if self.radio_sync.isChecked() else "exported"
+            self.progress_header.setText(f"\u2713 Done \u2014 {ok_count}/{total} files {action}")
             self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #4CAF50;")
         else:
-            self.progress_header.setText("\u2713 Done")
+            action = "Sync" if self.radio_sync.isChecked() else "Export"
+            self.progress_header.setText(f"\u2713 {action} complete")
             self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #4CAF50;")
-            if self._single_output_dir:
+            if not self.radio_sync.isChecked() and self._single_output_dir:
                 self.open_folder_btn.show()
 
-        self.btn_convert.setEnabled(True)
+        self.btn_action.setEnabled(True)
 
     def _on_error(self, msg: str):
         self._restore_stdout()
         self.progress_section.show()
         self.progress_header.setText(f"\u2717 Error: {msg}")
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #F44336;")
-        self.btn_convert.setEnabled(True)
+        self.btn_action.setEnabled(True)
+        # Auto-expand details so the user can see the full traceback
+        if not self.details_area.isVisible():
+            self.details_area.show()
+            self.copy_details_btn.show()
+            self.details_btn.setText("\u25BC Details")
 
     # -- results table interaction ------------------------------------------
 
@@ -515,20 +820,21 @@ class MainWindow(QMainWindow):
 
     def _load_file_steps(self, filename: str):
         steps = self._file_steps.get(filename, {})
-        for name in STEP_NAMES:
+        for name in self._current_step_names:
             status, detail = steps.get(name, ("pending", ""))
             self._set_step_display(name, status, detail)
-        # Update file-specific step labels
-        stem = Path(filename).stem
-        self.step_rows["Generate Basic.txt"][1].setText(f"Generate {stem} - Basic.txt")
-        self.step_rows["Generate Cloze.txt"][1].setText(f"Generate {stem} - Cloze.txt")
+        if not self.radio_sync.isChecked():
+            stem = Path(filename).stem
+            if "Generate Basic.txt" in self.step_rows:
+                self.step_rows["Generate Basic.txt"][1].setText(f"Generate {stem} - Basic.txt")
+            if "Generate Cloze.txt" in self.step_rows:
+                self.step_rows["Generate Cloze.txt"][1].setText(f"Generate {stem} - Cloze.txt")
         self.progress_header.setText(f"Steps: {filename}")
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
 
     # -- open folder --------------------------------------------------------
 
     def _open_folder(self, path: str):
-        # WSL: QDesktopServices can't open file:// URLs, use explorer.exe
         try:
             win_path = subprocess.check_output(
                 ["wslpath", "-w", path], text=True,
@@ -546,10 +852,19 @@ class MainWindow(QMainWindow):
     def _toggle_details(self):
         if self.details_area.isVisible():
             self.details_area.hide()
+            self.copy_details_btn.hide()
             self.details_btn.setText("\u25B6 Details")
         else:
             self.details_area.show()
+            self.copy_details_btn.show()
             self.details_btn.setText("\u25BC Details")
+
+    def _copy_details(self):
+        text = self.details_area.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.copy_details_btn.setText("Copied!")
+            QTimer.singleShot(1500, lambda: self.copy_details_btn.setText("Copy"))
 
     def _append_details(self, text: str):
         self.details_area.moveCursor(QTextCursor.MoveOperation.End)

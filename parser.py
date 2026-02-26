@@ -33,6 +33,7 @@ class ParsedNote:
     basic_cards: list[BasicCard]
     cloze_cards: list[ClozeCard]
     tags: str
+    deck_name: str = "Default"
 
 
 def find_vault_root(file_path: Path) -> Path:
@@ -87,6 +88,25 @@ def extract_tags(md_content: str) -> str:
         print("[parser] No tags found in frontmatter (subject/deck fields empty or 'default')")
 
     return result
+
+
+def extract_deck_name(md_content: str) -> str:
+    """
+    Extract the deck name from YAML frontmatter.
+    Returns the raw case-preserved value from the 'deck:' field.
+    Defaults to "Default" if not found.
+    """
+    frontmatter_match = re.match(r'^---\s*\n(.*?)\n---', md_content, re.DOTALL)
+    if not frontmatter_match:
+        return "Default"
+
+    frontmatter = frontmatter_match.group(1)
+    deck_match = re.search(r'^deck:\s*(.+)$', frontmatter, re.MULTILINE)
+    if deck_match:
+        deck = deck_match.group(1).strip()
+        if deck.lower() != "default" and deck:
+            return deck
+    return "Default"
 
 
 def _extract_flashcards_section(md_content: str) -> str:
@@ -200,6 +220,7 @@ def parse_note(file_path: str | Path) -> ParsedNote:
     print(f"[parser] File loaded ({len(content)} chars)")
 
     tags = extract_tags(content)
+    deck_name = extract_deck_name(content)
     basic_cards, cloze_cards = parse_flashcards(content)
 
     return ParsedNote(
@@ -208,4 +229,5 @@ def parse_note(file_path: str | Path) -> ParsedNote:
         basic_cards=basic_cards,
         cloze_cards=cloze_cards,
         tags=tags,
+        deck_name=deck_name,
     )
