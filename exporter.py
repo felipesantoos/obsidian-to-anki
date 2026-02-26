@@ -5,6 +5,9 @@ Takes parsed note data and produces tab-separated .txt files
 ready for Anki's built-in File → Import.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from pathlib import Path
 
 from . import images
@@ -110,55 +113,103 @@ def _print_import_instructions(files_created: list[Path], has_tags: bool) -> Non
         print(f"    {step}. Click Import")
 
 
-def export(note: ParsedNote, anki_media_path: str, dry_run: bool = False) -> None:
+def export(
+    note: ParsedNote,
+    anki_media_path: str,
+    dry_run: bool = False,
+    on_step: Callable[[str, str, str], None] | None = None,
+) -> list[Path]:
     """
     Export a parsed note to Anki-importable .txt files.
 
     Pipeline:
-    1. Scan cards for image references
-    2. Copy images to Anki's media folder
-    3. Generate Basic.txt (if Basic cards exist)
-    4. Generate Cloze.txt (if Cloze cards exist)
-    5. Print import instructions
+    1. Copy images to Anki's media folder
+    2. Generate Basic.txt (if Basic cards exist)
+    3. Generate Cloze.txt (if Cloze cards exist)
+    4. Print import instructions (CLI only)
+
+    When *on_step* is provided it is called as
+    ``on_step(step_name, status, detail)`` before and after each step
+    so the caller (e.g. the GUI worker) can update progress.
+
+    Returns the list of files created (empty on dry-run or no cards).
     """
+    files_created: list[Path] = []
+
     if not note.basic_cards and not note.cloze_cards:
         print("[export] No flashcards found — nothing to export")
-        return
+        if on_step:
+            on_step("Copy images", "skip", "")
+            on_step("Generate Basic.txt", "skip", "")
+            on_step("Generate Cloze.txt", "skip", "")
+        return files_created
 
-    # Step 1: Scan for images
-    print()
-    print(f"--- Step 1: Scan for images ---")
-    all_images = _collect_images(note)
+    # -- Copy images --------------------------------------------------------
+    if on_step:
+        on_step("Copy images", "running", "")
+    try:
+        print()
+        print("--- Step 1: Scan for images ---")
+        all_images = _collect_images(note)
+        print()
+        print("--- Step 2: Copy images to Anki media ---")
+        images.copy_to_anki(
+            all_images, note.file_path, note.vault_root, anki_media_path, dry_run
+        )
+        n = len(all_images)
+        if on_step:
+            on_step("Copy images", "done", f"{n} copied" if n else "none")
+    except Exception as e:
+        if on_step:
+            on_step("Copy images", "error", str(e))
 
-    # Step 2: Copy images to Anki
-    print()
-    print(f"--- Step 2: Copy images to Anki media ---")
-    images.copy_to_anki(
-        all_images, note.file_path, note.vault_root, anki_media_path, dry_run
-    )
-
-    # Step 3 & 4: Generate .txt files
+    # -- Generate .txt files ------------------------------------------------
     stem = note.file_path.stem
     output_dir = note.file_path.parent
-    files_created = []
 
+    # Basic cards
     if note.basic_cards:
-        print()
-        print(f"--- Step 3: Generate Basic cards ---")
-        basic_file = output_dir / f"{stem} - Basic.txt"
-        _write_basic_file(note.basic_cards, basic_file, note.tags, dry_run)
-        if not dry_run:
-            files_created.append(basic_file)
+        if on_step:
+            on_step("Generate Basic.txt", "running", "")
+        try:
+            print()
+            print("--- Step 3: Generate Basic cards ---")
+            basic_file = output_dir / f"{stem} - Basic.txt"
+            _write_basic_file(note.basic_cards, basic_file, note.tags, dry_run)
+            if not dry_run:
+                files_created.append(basic_file)
+            if on_step:
+                on_step("Generate Basic.txt", "done", "")
+        except Exception as e:
+            if on_step:
+                on_step("Generate Basic.txt", "error", str(e))
+    else:
+        if on_step:
+            on_step("Generate Basic.txt", "skip", "")
 
+    # Cloze cards
     if note.cloze_cards:
-        step_num = 4 if note.basic_cards else 3
-        print()
-        print(f"--- Step {step_num}: Generate Cloze cards ---")
-        cloze_file = output_dir / f"{stem} - Cloze.txt"
-        _write_cloze_file(note.cloze_cards, cloze_file, note.tags, dry_run)
-        if not dry_run:
-            files_created.append(cloze_file)
+        if on_step:
+            on_step("Generate Cloze.txt", "running", "")
+        try:
+            step_num = 4 if note.basic_cards else 3
+            print()
+            print(f"--- Step {step_num}: Generate Cloze cards ---")
+            cloze_file = output_dir / f"{stem} - Cloze.txt"
+            _write_cloze_file(note.cloze_cards, cloze_file, note.tags, dry_run)
+            if not dry_run:
+                files_created.append(cloze_file)
+            if on_step:
+                on_step("Generate Cloze.txt", "done", "")
+        except Exception as e:
+            if on_step:
+                on_step("Generate Cloze.txt", "error", str(e))
+    else:
+        if on_step:
+            on_step("Generate Cloze.txt", "skip", "")
 
-    # Step 5: Instructions
+    # Instructions (CLI)
     if files_created:
         _print_import_instructions(files_created, bool(note.tags))
+
+    return files_created

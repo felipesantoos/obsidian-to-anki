@@ -73,3 +73,21 @@ def get_anki_media_path(cli_override: str = None) -> str:
     save(config)
     print(f"[config] Saved to {CONFIG_FILE}")
     return path
+
+
+# ---------------------------------------------------------------------------
+# Shared folder-discovery helpers
+# ---------------------------------------------------------------------------
+
+SKIP_FOLDERS = {".obsidian", ".trash", ".git", "Scripts", "Templates"}
+
+
+def discover_md_files(folder: Path, recursive: bool) -> list[Path]:
+    """Find markdown files in *folder*, skipping non-note directories."""
+    if recursive:
+        all_md = sorted(folder.rglob("*.md"))
+        return [
+            f for f in all_md
+            if not any(part in SKIP_FOLDERS for part in f.relative_to(folder).parts)
+        ]
+    return sorted(folder.glob("*.md"))

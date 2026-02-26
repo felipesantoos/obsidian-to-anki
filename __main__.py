@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import get_anki_media_path
+from .config import get_anki_media_path, discover_md_files
 from .parser import parse_note
 from .exporter import export
 
@@ -69,18 +69,7 @@ def run_single(file_path: str, anki_media: str, dry_run: bool) -> None:
 def run_batch(folder_path: str, anki_media: str, dry_run: bool, recursive: bool = False) -> None:
     """Export all markdown files in a folder (optionally recursive)."""
     folder = Path(folder_path).resolve()
-
-    # Skip hidden folders and common non-note folders
-    skip_folders = {".obsidian", ".trash", ".git", "Scripts", "Templates"}
-
-    if recursive:
-        all_md = sorted(folder.rglob("*.md"))
-        md_files = [
-            f for f in all_md
-            if not any(part in skip_folders for part in f.relative_to(folder).parts)
-        ]
-    else:
-        md_files = sorted(folder.glob("*.md"))
+    md_files = discover_md_files(folder, recursive)
 
     mode = "Recursive (all subfolders)" if recursive else "Batch (folder)"
     _print_banner(mode, str(folder), anki_media, dry_run)

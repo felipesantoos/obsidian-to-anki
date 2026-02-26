@@ -6,7 +6,6 @@ Launch:
     python -m obsidian_to_anki.gui
 """
 
-import io
 import subprocess
 import sys
 from pathlib import Path
@@ -40,21 +39,13 @@ except ImportError:
 
 from . import __version__
 from .parser import parse_note
-from .exporter import (
-    _collect_images,
-    _write_basic_file,
-    _write_cloze_file,
-    _print_import_instructions,
-)
-from . import images
+from .exporter import export
 from . import config
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-SKIP_FOLDERS = {".obsidian", ".trash", ".git", "Scripts", "Templates"}
 
 STEP_NAMES = ["Parse note", "Copy images", "Generate Basic.txt", "Generate Cloze.txt"]
 
@@ -133,76 +124,14 @@ class ConvertWorker(QThread):
             self.file_done.emit(filename, 0, 0, False, "")
             return
 
-        # No cards → skip remaining steps
-        if bc == 0 and cc == 0:
-            for name in STEP_NAMES[1:]:
-                self.step_update.emit(name, "skip", "")
-            self.file_done.emit(filename, 0, 0, True, str(note.file_path.parent))
-            return
-
-        # Step 2 — Copy images
-        self.step_update.emit("Copy images", "running", "")
-        try:
-            all_images = _collect_images(note)
-            images.copy_to_anki(
-                all_images, note.file_path, note.vault_root,
-                self.anki_media, self.dry_run,
-            )
-            n = len(all_images)
-            self.step_update.emit("Copy images", "done", f"{n} copied" if n else "none")
-        except Exception as e:
-            self.step_update.emit("Copy images", "error", str(e))
-
-        # Prepare output paths
-        stem = note.file_path.stem
-        output_dir = note.file_path.parent
-        files_created: list[Path] = []
-
-        # Step 3 — Generate Basic.txt
-        if bc > 0:
-            self.step_update.emit("Generate Basic.txt", "running", "")
-            try:
-                basic_file = output_dir / f"{stem} - Basic.txt"
-                _write_basic_file(note.basic_cards, basic_file, note.tags, self.dry_run)
-                if not self.dry_run:
-                    files_created.append(basic_file)
-                self.step_update.emit("Generate Basic.txt", "done", "")
-            except Exception as e:
-                self.step_update.emit("Generate Basic.txt", "error", str(e))
-        else:
-            self.step_update.emit("Generate Basic.txt", "skip", "")
-
-        # Step 4 — Generate Cloze.txt
-        if cc > 0:
-            self.step_update.emit("Generate Cloze.txt", "running", "")
-            try:
-                cloze_file = output_dir / f"{stem} - Cloze.txt"
-                _write_cloze_file(note.cloze_cards, cloze_file, note.tags, self.dry_run)
-                if not self.dry_run:
-                    files_created.append(cloze_file)
-                self.step_update.emit("Generate Cloze.txt", "done", "")
-            except Exception as e:
-                self.step_update.emit("Generate Cloze.txt", "error", str(e))
-        else:
-            self.step_update.emit("Generate Cloze.txt", "skip", "")
-
-        # Import instructions (printed to stdout → details panel)
-        if files_created:
-            _print_import_instructions(files_created, bool(note.tags))
-
-        self.file_done.emit(filename, bc, cc, True, str(output_dir))
+        # Steps 2–4 — delegated to export()
+        export(note, self.anki_media, dry_run=self.dry_run, on_step=self.step_update.emit)
+        self.file_done.emit(filename, bc, cc, True, str(note.file_path.parent))
 
     # -- batch ---------------------------------------------------------------
 
     def _run_batch(self, folder: Path):
-        if self.recursive:
-            all_md = sorted(folder.rglob("*.md"))
-            md_files = [
-                f for f in all_md
-                if not any(part in SKIP_FOLDERS for part in f.relative_to(folder).parts)
-            ]
-        else:
-            md_files = sorted(folder.glob("*.md"))
+        md_files = config.discover_md_files(folder, self.recursive)
 
         if not md_files:
             print(f"[batch] No .md files found in: {folder}")
@@ -493,6 +422,13 @@ class MainWindow(QMainWindow):
         if self._is_batch:
             self.results_section.show()
 
+    def _set_step_display(self, step_name: str, status: str, detail: str):
+        """Update the icon, colour, and detail label for a single step row."""
+        icon_lbl, _name_lbl, detail_lbl = self.step_rows[step_name]
+        icon_lbl.setText(STEP_ICONS.get(status, STEP_ICONS["pending"]))
+        icon_lbl.setStyleSheet(STEP_COLORS.get(status, ""))
+        detail_lbl.setText(detail)
+
     def _on_step_update(self, step_name: str, status: str, detail: str):
         if step_name not in self.step_rows:
             return
@@ -503,10 +439,7 @@ class MainWindow(QMainWindow):
 
         # Only update UI if viewing the file being processed
         if self._viewing_file == self._current_file:
-            icon_lbl, _name_lbl, detail_lbl = self.step_rows[step_name]
-            icon_lbl.setText(STEP_ICONS.get(status, STEP_ICONS["pending"]))
-            icon_lbl.setStyleSheet(STEP_COLORS.get(status, ""))
-            detail_lbl.setText(detail)
+            self._set_step_display(step_name, status, detail)
 
     def _on_file_done(self, filename: str, basic_count: int, cloze_count: int,
                        ok: bool, output_dir: str):
@@ -584,10 +517,7 @@ class MainWindow(QMainWindow):
         steps = self._file_steps.get(filename, {})
         for name in STEP_NAMES:
             status, detail = steps.get(name, ("pending", ""))
-            icon_lbl, _name_lbl, detail_lbl = self.step_rows[name]
-            icon_lbl.setText(STEP_ICONS.get(status, STEP_ICONS["pending"]))
-            icon_lbl.setStyleSheet(STEP_COLORS.get(status, ""))
-            detail_lbl.setText(detail)
+            self._set_step_display(name, status, detail)
         # Update file-specific step labels
         stem = Path(filename).stem
         self.step_rows["Generate Basic.txt"][1].setText(f"Generate {stem} - Basic.txt")
