@@ -23,6 +23,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QDialog,
         QFileDialog,
         QFrame,
         QGroupBox,
@@ -35,7 +36,6 @@ try:
         QPushButton,
         QRadioButton,
         QSizePolicy,
-        QSplitter,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
@@ -436,8 +436,12 @@ class MainWindow(QMainWindow):
 
         # -- Progress section (enhanced step rows) --------------------------
         self.progress_section = QWidget()
+        self.progress_section.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
         prog_lay = QVBoxLayout(self.progress_section)
-        prog_lay.setContentsMargins(0, 8, 0, 0)
+        prog_lay.setContentsMargins(0, 4, 0, 0)
+        prog_lay.setSpacing(1)
 
         self.progress_header = QLabel()
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px;")
@@ -450,9 +454,9 @@ class MainWindow(QMainWindow):
         ]
         for name in all_step_names:
             frame = QFrame()
-            frame.setStyleSheet("padding: 2px 6px; border-radius: 4px;")
+            frame.setStyleSheet("padding: 1px 4px; border-radius: 4px;")
             row_lay = QHBoxLayout(frame)
-            row_lay.setContentsMargins(6, 2, 6, 2)
+            row_lay.setContentsMargins(4, 1, 4, 1)
 
             icon_lbl = QLabel(STEP_ICONS["pending"])
             icon_font = icon_lbl.font()
@@ -490,25 +494,13 @@ class MainWindow(QMainWindow):
         self.open_folder_btn.hide()
 
         # -- Details toggle button (always visible once processing starts) --
-        details_header = QHBoxLayout()
-        self.details_btn = QPushButton("\u25B6 Details")
-        self.details_btn.setFlat(True)
-        self.details_btn.setStyleSheet("text-align: left; padding: 4px;")
+        self.details_btn = QPushButton("Show Log")
+        self.details_btn.setFixedWidth(80)
         self.details_btn.clicked.connect(self._toggle_details)
-        details_header.addWidget(self.details_btn)
-        details_header.addStretch()
-        self.copy_details_btn = QPushButton("Copy")
-        self.copy_details_btn.setFixedWidth(50)
-        self.copy_details_btn.clicked.connect(self._copy_details)
-        self.copy_details_btn.hide()
-        details_header.addWidget(self.copy_details_btn)
-        output_lay.addLayout(details_header)
+        output_lay.addWidget(self.details_btn)
         self.details_btn.hide()
 
-        # -- Splitter: results (top) + details panel (bottom) ---------------
-        self.splitter = QSplitter(Qt.Orientation.Vertical)
-
-        # Results section (top of splitter)
+        # -- Results section (direct in output layout) ----------------------
         self.results_section = QWidget()
         res_lay = QVBoxLayout(self.results_section)
         res_lay.setContentsMargins(0, 8, 0, 0)
@@ -535,31 +527,31 @@ class MainWindow(QMainWindow):
             "  border: 1px solid #E0E0E0;"
             "}"
         )
+        self.results_table.setMinimumHeight(150)
         self.results_table.cellClicked.connect(self._on_result_clicked)
         res_lay.addWidget(self.results_table)
 
-        self.splitter.addWidget(self.results_section)
+        output_lay.addWidget(self.results_section, 1)
+        self.results_section.hide()
 
-        # Details panel (bottom of splitter, resizable)
-        self.details_panel = QWidget()
-        det_lay = QVBoxLayout(self.details_panel)
-        det_lay.setContentsMargins(0, 0, 0, 0)
+        # -- Details log dialog (separate window) ---------------------------
+        self._details_dialog = QDialog(self)
+        self._details_dialog.setWindowTitle("Log Output")
+        self._details_dialog.resize(700, 400)
+        dlg_lay = QVBoxLayout(self._details_dialog)
 
         self.details_area = QTextEdit()
         self.details_area.setReadOnly(True)
         self.details_area.setFont(QFont("Consolas", 9))
-        det_lay.addWidget(self.details_area)
+        dlg_lay.addWidget(self.details_area)
 
-        self.splitter.addWidget(self.details_panel)
-
-        # Initial splitter proportions (70/30)
-        self.splitter.setStretchFactor(0, 7)
-        self.splitter.setStretchFactor(1, 3)
-
-        output_lay.addWidget(self.splitter, 1)
-
-        self.results_section.hide()
-        self.details_panel.hide()
+        dlg_btn_row = QHBoxLayout()
+        dlg_btn_row.addStretch()
+        self.copy_details_btn = QPushButton("Copy All")
+        self.copy_details_btn.setFixedWidth(80)
+        self.copy_details_btn.clicked.connect(self._copy_details)
+        dlg_btn_row.addWidget(self.copy_details_btn)
+        dlg_lay.addLayout(dlg_btn_row)
 
         main_layout.addWidget(output_zone, 1)
 
@@ -732,14 +724,12 @@ class MainWindow(QMainWindow):
         self.details_area.clear()
         self.results_table.setRowCount(0)
         self.results_section.hide()
-        self.details_panel.hide()
+        self._details_dialog.hide()
         self._reset_steps()
         self.progress_section.hide()
         self.batch_progress.hide()
         self.batch_progress.setValue(0)
         self.details_btn.show()
-        self.copy_details_btn.hide()
-        self.details_btn.setText("\u25B6 Details")
         self.btn_action.setEnabled(False)
 
     def _show_validation_error(self, msg: str):
@@ -756,7 +746,7 @@ class MainWindow(QMainWindow):
                 icon_lbl.setStyleSheet("")
                 detail_lbl.setText("")
                 time_lbl.setText("")
-                frame.setStyleSheet("padding: 2px 6px; border-radius: 4px;")
+                frame.setStyleSheet("padding: 1px 4px; border-radius: 4px;")
         self._step_timers.clear()
 
     def _restore_stdout(self):
@@ -812,7 +802,7 @@ class MainWindow(QMainWindow):
 
         # Background color
         bg = STEP_BG_COLORS.get(status, "")
-        frame.setStyleSheet(f"padding: 2px 6px; {bg}")
+        frame.setStyleSheet(f"padding: 1px 4px; {bg}")
 
         # Timer management
         if status == "running":
@@ -967,11 +957,9 @@ class MainWindow(QMainWindow):
         self.progress_header.setText(f"\u2717 Error: {msg}")
         self.progress_header.setStyleSheet("font-weight: bold; font-size: 13px; color: #F44336;")
         self.btn_action.setEnabled(True)
-        # Auto-expand details so the user can see the full traceback
-        if not self.details_panel.isVisible():
-            self.details_panel.show()
-            self.copy_details_btn.show()
-            self.details_btn.setText("\u25BC Details")
+        # Auto-open log dialog so the user can see the full traceback
+        if not self._details_dialog.isVisible():
+            self._details_dialog.show()
 
     # -- results table interaction ------------------------------------------
 
@@ -1083,21 +1071,18 @@ class MainWindow(QMainWindow):
     # -- details panel ------------------------------------------------------
 
     def _toggle_details(self):
-        if self.details_panel.isVisible():
-            self.details_panel.hide()
-            self.copy_details_btn.hide()
-            self.details_btn.setText("\u25B6 Details")
+        if self._details_dialog.isVisible():
+            self._details_dialog.hide()
         else:
-            self.details_panel.show()
-            self.copy_details_btn.show()
-            self.details_btn.setText("\u25BC Details")
+            self._details_dialog.show()
+            self._details_dialog.raise_()
 
     def _copy_details(self):
         text = self.details_area.toPlainText()
         if text:
             QApplication.clipboard().setText(text)
             self.copy_details_btn.setText("Copied!")
-            QTimer.singleShot(1500, lambda: self.copy_details_btn.setText("Copy"))
+            QTimer.singleShot(1500, lambda: self.copy_details_btn.setText("Copy All"))
 
     def _append_details(self, text: str):
         self.details_area.moveCursor(QTextCursor.MoveOperation.End)
