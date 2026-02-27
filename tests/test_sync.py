@@ -436,3 +436,196 @@ class TestSyncNote:
 
         result = sync_note(note, mock_anki_client)
         assert len(result.errors) > 0
+
+    def test_update_error_records_and_continues(self, tmp_path, mock_anki_client):
+        """AnkiConnectError during update_note records error, doesn't crash."""
+        from obsidian_to_anki.ankiconnect import AnkiConnectError
+        md_content = (
+            "## Flashcards\n\n"
+            "<!-- anki-id: 100 -->\n"
+            "Q: Changed Q\nA: Changed A\n"
+        )
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.notes_info.return_value = [
+            AnkiNoteInfo(
+                note_id=100, model_name="Basic", tags=[],
+                fields={"Front": "Old Q", "Back": "Old A"}, mod=0,
+            )
+        ]
+        mock_anki_client.update_note.side_effect = AnkiConnectError("update failed")
+
+        result = sync_note(note, mock_anki_client)
+        assert result.error_count == 1
+        assert any("Update failed" in e for e in result.errors)
+        assert any(d.action == CardAction.ERROR for d in result.details)
+
+    def test_add_new_card_error_records(self, tmp_path, mock_anki_client):
+        """AnkiConnectError during add_note for new card records error."""
+        from obsidian_to_anki.ankiconnect import AnkiConnectError
+        md_content = "## Flashcards\n\nQ: Q1\nA: A1\n"
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.side_effect = AnkiConnectError("add failed")
+
+        result = sync_note(note, mock_anki_client)
+        assert result.error_count == 1
+        assert any("Add failed" in e for e in result.errors)
+
+    def test_recreate_error_records(self, tmp_path, mock_anki_client):
+        """AnkiConnectError when re-creating a card deleted from Anki."""
+        from obsidian_to_anki.ankiconnect import AnkiConnectError
+        md_content = (
+            "## Flashcards\n\n"
+            "<!-- anki-id: 999 -->\n"
+            "Q: Q1\nA: A1\n"
+        )
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.notes_info.return_value = []  # deleted from Anki
+        mock_anki_client.add_note.side_effect = AnkiConnectError("re-create failed")
+
+        result = sync_note(note, mock_anki_client)
+        assert result.deleted_from_anki == 1
+        assert result.error_count == 1
+        assert any("Re-create failed" in e for e in result.errors)
+
+    def test_orphan_detection_error_continues(self, tmp_path, mock_anki_client):
+        """AnkiConnectError during find_notes (orphan detection) records error."""
+        from obsidian_to_anki.ankiconnect import AnkiConnectError
+        md_content = "## Flashcards\n\nQ: Q1\nA: A1\n"
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.return_value = 500
+        mock_anki_client.find_notes.side_effect = AnkiConnectError("search failed")
+
+        result = sync_note(note, mock_anki_client)
+        # Card still added successfully
+        assert result.new_count == 1
+        # Orphan error recorded
+        assert any("Orphan detection failed" in e for e in result.errors)
+
+    def test_write_ids_failure_records_error(self, tmp_path, mock_anki_client):
+        """Exception during write_ids_to_markdown records error."""
+        md_content = "## Flashcards\n\nQ: Q1\nA: A1\n"
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.return_value = 500
+
+        with patch("obsidian_to_anki.sync.write_ids_to_markdown",
+                    side_effect=PermissionError("read-only file")):
+            steps = []
+            result = sync_note(note, mock_anki_client,
+                               on_step=lambda s, st, d: steps.append((s, st)))
+
+        assert any("Write IDs failed" in e for e in result.errors)
+        assert ("Write IDs", "error") in steps
+
+    def test_image_copy_with_media_from_client(self, tmp_path, mock_anki_client):
+        """Images are copied when get_media_dir_path returns a valid path."""
+        md_content = (
+            "## Flashcards\n\n"
+            "Q: What is this?\n"
+            "A: A cell ![[cell.png]]\n"
+        )
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.return_value = 500
+
+        # Create the image in vault
+        img_dir = note.vault_root / "images"
+        img_dir.mkdir(exist_ok=True)
+        (img_dir / "cell.png").write_bytes(b"\x89PNG data")
+
+        # AnkiConnect returns media dir path
+        media_dir = tmp_path / "anki_media"
+        media_dir.mkdir()
+        mock_anki_client.get_media_dir_path.return_value = str(media_dir)
+
+        result = sync_note(note, mock_anki_client)
+        assert (media_dir / "cell.png").exists()
+
+    def test_image_copy_falls_back_to_config(self, tmp_path, mock_anki_client):
+        """When get_media_dir_path returns None, falls back to config."""
+        md_content = (
+            "## Flashcards\n\n"
+            "Q: See image\n"
+            "A: ![[pic.png]]\n"
+        )
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.return_value = 500
+        mock_anki_client.get_media_dir_path.return_value = None
+
+        # Create image
+        (note.vault_root / "images").mkdir(exist_ok=True)
+        (note.vault_root / "images" / "pic.png").write_bytes(b"png")
+
+        media_dir = tmp_path / "config_media"
+        media_dir.mkdir()
+
+        with patch("obsidian_to_anki.config.load",
+                    return_value={"anki_media_path": str(media_dir)}):
+            result = sync_note(note, mock_anki_client)
+
+        assert (media_dir / "pic.png").exists()
+
+    def test_image_copy_no_media_path_warns(self, tmp_path, mock_anki_client):
+        """No media path available anywhere records a warning."""
+        md_content = (
+            "## Flashcards\n\n"
+            "Q: See\n"
+            "A: ![[img.png]]\n"
+        )
+        note = self._make_note(tmp_path, md_content)
+        mock_anki_client.add_note.return_value = 500
+        mock_anki_client.get_media_dir_path.return_value = None
+
+        with patch("obsidian_to_anki.config.load", return_value={}):
+            result = sync_note(note, mock_anki_client)
+
+        assert any("Could not determine Anki media path" in e for e in result.errors)
+
+
+# ── _to_local_path (additional) ─────────────────────────────────────────
+
+class TestToLocalPathWSL:
+    @patch("subprocess.check_output", return_value="/mnt/c/Users/media\n")
+    @patch("obsidian_to_anki.sync.sys")
+    def test_wslpath_conversion_success(self, mock_sys, mock_check):
+        mock_sys.platform = "linux"
+        result = _to_local_path("C:\\Users\\media")
+        assert result == "/mnt/c/Users/media"
+        mock_check.assert_called_once()
+
+    @patch("subprocess.check_output", side_effect=FileNotFoundError("no wslpath"))
+    @patch("obsidian_to_anki.sync.sys")
+    def test_wslpath_not_found_returns_original(self, mock_sys, mock_check):
+        mock_sys.platform = "linux"
+        result = _to_local_path("C:\\Users\\media")
+        assert result == "C:\\Users\\media"
+
+
+# ── write_ids_to_markdown (additional) ──────────────────────────────────
+
+class TestWriteIdsMixed:
+    def test_write_ids_mixed_basic_and_cloze(self, tmp_path):
+        """IDs correctly assigned to interleaved basic and cloze cards."""
+        md = tmp_path / "note.md"
+        md.write_text(
+            "## Flashcards\n\n"
+            "Q: Basic Q\nA: Basic A\n\n"
+            "{{c1::Cloze}} text\n\n"
+            "Q: Another Q\nA: Another A\n",
+            encoding="utf-8",
+        )
+        cards = [
+            (BasicCard(front="Basic Q", back="Basic A"), None),
+            (ClozeCard(text="{{c1::Cloze}} text"), None),
+            (BasicCard(front="Another Q", back="Another A"), None),
+        ]
+        id_map = {0: 100, 1: 200, 2: 300}
+        write_ids_to_markdown(md, cards, id_map)
+
+        content = md.read_text(encoding="utf-8")
+        assert "<!-- anki-id: 100 -->" in content
+        assert "<!-- anki-id: 200 -->" in content
+        assert "<!-- anki-id: 300 -->" in content
+        # Verify ordering: 100 before 200 before 300
+        pos_100 = content.index("anki-id: 100")
+        pos_200 = content.index("anki-id: 200")
+        pos_300 = content.index("anki-id: 300")
+        assert pos_100 < pos_200 < pos_300

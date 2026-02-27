@@ -2,6 +2,7 @@
 
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 
 from obsidian_to_anki.parser import BasicCard, ClozeCard, ParsedNote
 from obsidian_to_anki.exporter import (
@@ -217,3 +218,107 @@ class TestExport:
         files = export(note, str(tmp_anki_media))
         content = files[0].read_text(encoding="utf-8")
         assert "bio science" in content
+
+
+# ── _write_cloze_file (parity tests) ────────────────────────────────────
+
+class TestWriteClozeFileParity:
+    def test_cloze_newlines_converted(self, tmp_path):
+        cards = [ClozeCard(text="{{c1::Water}} is\ncomposed of H2O")]
+        out = tmp_path / "cloze.txt"
+        _write_cloze_file(cards, out, tags="", dry_run=False)
+        content = out.read_text(encoding="utf-8")
+        assert "{{c1::Water}} is<br>composed of H2O" in content
+        # No raw newlines in the card content (only the trailing \n)
+        lines = content.splitlines()
+        assert len(lines) == 1
+
+    def test_cloze_image_conversion(self, tmp_path):
+        cards = [ClozeCard(text="{{c1::Cell}} looks like ![[cell.png]]")]
+        out = tmp_path / "cloze.txt"
+        _write_cloze_file(cards, out, tags="", dry_run=False)
+        content = out.read_text(encoding="utf-8")
+        assert '<img src="cell.png">' in content
+        assert "![[" not in content
+
+    def test_cloze_multiple_cards(self, tmp_path):
+        cards = [
+            ClozeCard(text="{{c1::Water}} is H2O"),
+            ClozeCard(text="{{c1::Carbon}} has 6 protons"),
+            ClozeCard(text="{{c1::Oxygen}} is O"),
+        ]
+        out = tmp_path / "cloze.txt"
+        _write_cloze_file(cards, out, tags="", dry_run=False)
+        lines = out.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+
+
+# ── export error branches ───────────────────────────────────────────────
+
+class TestExportErrorBranches:
+    def test_export_image_copy_exception(self, parsed_note_factory, tmp_anki_media):
+        """Exception during image copy emits error callback but doesn't crash."""
+        note = parsed_note_factory(
+            basic_cards=[BasicCard(front="Q", back="A")],
+            file_name="err.md",
+        )
+        steps = []
+        with patch("obsidian_to_anki.exporter.images.copy_to_anki",
+                    side_effect=PermissionError("access denied")):
+            files = export(note, str(tmp_anki_media),
+                           on_step=lambda s, st, d: steps.append((s, st, d)))
+        # Image step should report error
+        assert ("Copy images", "error", "access denied") in steps
+        # Basic file should still be created
+        assert len(files) == 1
+
+    def test_export_basic_write_exception(self, parsed_note_factory, tmp_anki_media):
+        """Exception during Basic.txt write emits error callback."""
+        note = parsed_note_factory(
+            basic_cards=[BasicCard(front="Q", back="A")],
+            cloze_cards=[ClozeCard(text="{{c1::x}}")],
+            file_name="err2.md",
+        )
+        steps = []
+        with patch("obsidian_to_anki.exporter._write_basic_file",
+                    side_effect=OSError("disk full")):
+            files = export(note, str(tmp_anki_media),
+                           on_step=lambda s, st, d: steps.append((s, st, d)))
+        # Basic step should report error
+        assert any(s == "Generate Basic.txt" and st == "error" for s, st, d in steps)
+        # Cloze should still be created
+        assert len(files) == 1
+        assert "Cloze" in files[0].name
+
+    def test_export_cloze_write_exception(self, parsed_note_factory, tmp_anki_media):
+        """Exception during Cloze.txt write emits error callback."""
+        note = parsed_note_factory(
+            basic_cards=[BasicCard(front="Q", back="A")],
+            cloze_cards=[ClozeCard(text="{{c1::x}}")],
+            file_name="err3.md",
+        )
+        steps = []
+        with patch("obsidian_to_anki.exporter._write_cloze_file",
+                    side_effect=OSError("disk full")):
+            files = export(note, str(tmp_anki_media),
+                           on_step=lambda s, st, d: steps.append((s, st, d)))
+        # Cloze step should report error
+        assert any(s == "Generate Cloze.txt" and st == "error" for s, st, d in steps)
+        # Basic should still be created
+        assert len(files) == 1
+        assert "Basic" in files[0].name
+
+    def test_export_on_step_error_callbacks(self, parsed_note_factory, tmp_anki_media):
+        """All error callbacks include the status 'error' and detail string."""
+        note = parsed_note_factory(
+            basic_cards=[BasicCard(front="Q", back="A")],
+            file_name="cb.md",
+        )
+        steps = []
+        with patch("obsidian_to_anki.exporter.images.copy_to_anki",
+                    side_effect=RuntimeError("boom")):
+            export(note, str(tmp_anki_media),
+                   on_step=lambda s, st, d: steps.append((s, st, d)))
+        error_steps = [(s, st, d) for s, st, d in steps if st == "error"]
+        assert len(error_steps) == 1
+        assert error_steps[0][2] == "boom"

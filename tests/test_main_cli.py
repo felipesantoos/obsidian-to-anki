@@ -201,3 +201,62 @@ class TestRunSyncBatch:
     def test_empty_folder(self, tmp_path):
         with patch("obsidian_to_anki.ankiconnect.AnkiConnectClient"):
             run_sync_batch(str(tmp_path), "http://localhost:8765", False, False, False)
+
+    @patch("obsidian_to_anki.sync.sync_note")
+    @patch("obsidian_to_anki.ankiconnect.AnkiConnectClient")
+    @patch("obsidian_to_anki.__main__.parse_note")
+    def test_continues_on_error(self, mock_parse, mock_client_cls, mock_sync, tmp_path):
+        (tmp_path / "a.md").write_text("x")
+        (tmp_path / "b.md").write_text("x")
+        mock_parse.side_effect = [Exception("fail"), MagicMock()]
+        client = mock_client_cls.return_value
+        client.ping.return_value = True
+        client.version.return_value = 6
+        mock_sync.return_value = MagicMock(
+            new_count=0, updated_count=0, unchanged_count=0,
+            deleted_from_obsidian=0, deleted_from_anki=0,
+            error_count=0, errors=[], file_path="b.md",
+        )
+
+        run_sync_batch(str(tmp_path), "http://localhost:8765", False, False, False)
+        # Second file should still be processed
+        assert mock_parse.call_count == 2
+
+    @patch("obsidian_to_anki.ankiconnect.AnkiConnectClient")
+    def test_ping_failure_exits(self, mock_client_cls, tmp_path):
+        (tmp_path / "a.md").write_text("x")
+        client = mock_client_cls.return_value
+        client.ping.return_value = False
+
+        with pytest.raises(SystemExit):
+            run_sync_batch(str(tmp_path), "http://localhost:8765", False, False, False)
+
+
+# ── main() additional flag tests ────────────────────────────────────────
+
+class TestMainAdditionalFlags:
+    def test_gui_flag_launches_gui(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["prog", "--gui"])
+        mock_gui_module = MagicMock()
+        with patch.dict("sys.modules", {"obsidian_to_anki.gui": mock_gui_module}):
+            main()
+        mock_gui_module.main.assert_called_once()
+
+    def test_version_flag(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["prog", "--version"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "obsidian_to_anki" in captured.out
+
+    @patch("obsidian_to_anki.__main__.run_sync_single")
+    @patch("obsidian_to_anki.__main__.get_ankiconnect_url", return_value="http://custom:9999")
+    def test_ankiconnect_url_override(self, mock_url, mock_run, tmp_path, monkeypatch):
+        md = tmp_path / "note.md"
+        md.write_text("x")
+        monkeypatch.setattr(sys, "argv", [
+            "prog", str(md), "--sync", "--ankiconnect-url", "http://custom:9999"
+        ])
+        main()
+        mock_url.assert_called_once_with("http://custom:9999")

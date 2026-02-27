@@ -239,3 +239,33 @@ class TestMedia:
         req = mock_urlopen.call_args[0][0]
         payload = json.loads(req.data)
         assert payload["params"]["filename"] == "img.png"
+
+
+# ── export_package ──────────────────────────────────────────────────────
+
+class TestExportPackage:
+    @patch("urllib.request.urlopen")
+    def test_export_package_success(self, mock_urlopen, client):
+        mock_urlopen.return_value = _mock_response(result=True)
+        assert client.export_package("Default", "/tmp/deck.apkg") is True
+
+    @patch("urllib.request.urlopen")
+    def test_export_package_sends_params(self, mock_urlopen, client):
+        mock_urlopen.return_value = _mock_response(result=True)
+        client.export_package("Science", "/backup/sci.apkg", include_sched=False)
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data)
+        assert payload["action"] == "exportPackage"
+        assert payload["params"]["deck"] == "Science"
+        assert payload["params"]["path"] == "/backup/sci.apkg"
+        assert payload["params"]["includeSched"] is False
+
+
+# ── _invoke edge cases ─────────────────────────────────────────────────
+
+class TestInvokeEdgeCases:
+    @patch("urllib.request.urlopen")
+    def test_os_error_raises(self, mock_urlopen, client):
+        mock_urlopen.side_effect = OSError("network down")
+        with pytest.raises(AnkiConnectError, match="Cannot reach"):
+            client._invoke("version")

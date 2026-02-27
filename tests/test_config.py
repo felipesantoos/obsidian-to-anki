@@ -190,3 +190,35 @@ class TestDiscoverMdFiles:
         result = config_mod.discover_md_files(tmp_path, recursive=False)
         assert result[0].name == "a.md"
         assert result[1].name == "z.md"
+
+
+# ── Edge cases ──────────────────────────────────────────────────────────
+
+class TestLoadEdgeCases:
+    def test_load_malformed_json(self):
+        """Corrupted config.json should raise (caller handles it)."""
+        config_mod.CONFIG_FILE.write_text("{bad json!!", encoding="utf-8")
+        with pytest.raises(Exception):  # json.JSONDecodeError
+            config_mod.load()
+
+
+class TestGetAnkiMediaPathEdgeCases:
+    def test_media_path_strips_quotes(self, tmp_path, monkeypatch):
+        """User pastes path with surrounding quotes — they should be stripped."""
+        media = str(tmp_path / "quoted_media")
+        # Simulate user typing: "  '/path/to/media'  "
+        monkeypatch.setattr("builtins.input", lambda _: f'  "{media}"  ')
+        result = config_mod.get_anki_media_path()
+        assert result == media
+
+
+class TestGetAnkiconnectUrlEdgeCases:
+    def test_ankiconnect_url_cli_override_saved(self):
+        """CLI override for URL should persist in config."""
+        config_mod.get_ankiconnect_url(cli_override="http://custom:9999")
+        # Verify it's saved
+        loaded = config_mod.load()
+        assert loaded["ankiconnect_url"] == "http://custom:9999"
+        # Verify subsequent call without override returns the saved value
+        result = config_mod.get_ankiconnect_url()
+        assert result == "http://custom:9999"
