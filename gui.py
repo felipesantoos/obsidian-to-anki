@@ -199,16 +199,18 @@ class SyncWorker(QThread):
     file_started = Signal(str, int, int)       # filename, index, total
     step_update  = Signal(str, str, str)       # step_name, status, detail
     file_done    = Signal(str, int, int, int, int, bool)  # filename, new, updated, unchanged, deleted, ok
+    backup_done  = Signal(str)                 # wsl_backup_dir path
     finished_ok  = Signal()
     finished_err = Signal(str)
 
-    def __init__(self, path: str, url: str, dry_run: bool, recursive: bool, delete_orphans: bool):
+    def __init__(self, path: str, url: str, dry_run: bool, recursive: bool, delete_orphans: bool, backup: bool):
         super().__init__()
         self.path = path
         self.url = url
         self.dry_run = dry_run
         self.recursive = recursive
         self.delete_orphans = delete_orphans
+        self.backup = backup
 
     def _run_single(self, file_path: Path, index: int, total: int):
         from .ankiconnect import AnkiConnectClient
@@ -267,6 +269,8 @@ class SyncWorker(QThread):
 
     def run(self):
         from .ankiconnect import AnkiConnectClient, AnkiConnectError
+        from datetime import datetime
+        from pathlib import PureWindowsPath
 
         try:
             # Pre-check connection
@@ -277,6 +281,40 @@ class SyncWorker(QThread):
                     "Is Anki running with AnkiConnect installed?"
                 )
                 return
+
+            # Backup collection before sync
+            if self.backup and not self.dry_run:
+                try:
+                    media_dir = client.get_media_dir_path()
+                    if not media_dir:
+                        self.finished_err.emit("Backup failed: could not determine Anki media path.")
+                        return
+                    # media_dir is a Windows path; use PureWindowsPath to parse it
+                    win_profile_dir = PureWindowsPath(media_dir).parent
+                    win_backup_dir = win_profile_dir / "backups"
+
+                    # Convert to WSL path so we can mkdir from Linux
+                    wsl_backup_dir = subprocess.check_output(
+                        ["wslpath", "-u", str(win_backup_dir)], text=True,
+                    ).strip()
+                    Path(wsl_backup_dir).mkdir(exist_ok=True)
+
+                    all_decks = client.deck_names()
+                    root_decks = [d for d in all_decks if "::" not in d]
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    print(f"[backup] Backing up {len(root_decks)} root deck(s)...")
+                    for deck in root_decks:
+                        safe_name = deck.replace("/", "_").replace("\\", "_")
+                        win_apkg_path = str(win_backup_dir / f"{safe_name}_{timestamp}.apkg")
+                        print(f"[backup] Exporting '{deck}' → {win_apkg_path}")
+                        client.export_package(deck, win_apkg_path)
+                        print(f"[backup] Done: {win_apkg_path}")
+                    print(f"[backup] All backups complete.\n")
+                    self.backup_done.emit(wsl_backup_dir)
+                except AnkiConnectError as e:
+                    self.finished_err.emit(f"Backup failed: {e}")
+                    return
 
             target = Path(self.path).resolve()
             if target.is_dir():
@@ -390,12 +428,16 @@ class MainWindow(QMainWindow):
         self.chk_dry = QCheckBox("Dry run")
         self.chk_recursive = QCheckBox("Recursive")
         self.chk_delete_orphans = QCheckBox("Delete orphans")
+        self.chk_backup = QCheckBox("Backup collection")
+        self.chk_backup.setChecked(True)
         h3.addWidget(self.chk_dry)
         h3.addWidget(self.chk_recursive)
         h3.addWidget(self.chk_delete_orphans)
+        h3.addWidget(self.chk_backup)
         h3.addStretch()
         input_lay.addLayout(h3)
         self.chk_delete_orphans.hide()
+        self.chk_backup.hide()
 
         # -- Action button --------------------------------------------------
         self.btn_action = QPushButton("Convert")
@@ -487,18 +529,29 @@ class MainWindow(QMainWindow):
         output_lay.addWidget(self.progress_section)
         self.progress_section.hide()
 
-        # -- Open folder button (single-file export mode) -------------------
+        # -- Open folder buttons -----------------------------------------------
         self.open_folder_btn = QPushButton("Open Output Folder")
         self.open_folder_btn.clicked.connect(self._open_single_folder)
         output_lay.addWidget(self.open_folder_btn)
         self.open_folder_btn.hide()
 
-        # -- Details toggle button (always visible once processing starts) --
+        # -- Details / backup button row ---------------------------------------
+        btn_row = QHBoxLayout()
         self.details_btn = QPushButton("Show Log")
         self.details_btn.setFixedWidth(80)
         self.details_btn.clicked.connect(self._toggle_details)
-        output_lay.addWidget(self.details_btn)
+        btn_row.addWidget(self.details_btn)
         self.details_btn.hide()
+
+        self.open_backup_btn = QPushButton("Open Backup Folder")
+        self.open_backup_btn.setFixedWidth(140)
+        self.open_backup_btn.clicked.connect(self._open_backup_folder)
+        btn_row.addWidget(self.open_backup_btn)
+        self.open_backup_btn.hide()
+        self._backup_dir = ""
+
+        btn_row.addStretch()
+        output_lay.addLayout(btn_row)
 
         # -- Results section (direct in output layout) ----------------------
         self.results_section = QWidget()
@@ -565,6 +618,7 @@ class MainWindow(QMainWindow):
         self.grp_media.setVisible(not is_sync)
         self.grp_url.setVisible(is_sync)
         self.chk_delete_orphans.setVisible(is_sync)
+        self.chk_backup.setVisible(is_sync)
         self.btn_action.setText("Sync" if is_sync else "Convert")
 
         # Update step visibility
@@ -704,10 +758,12 @@ class MainWindow(QMainWindow):
             dry_run=self.chk_dry.isChecked(),
             recursive=self.chk_recursive.isChecked(),
             delete_orphans=self.chk_delete_orphans.isChecked(),
+            backup=self.chk_backup.isChecked(),
         )
         self._worker.file_started.connect(self._on_file_started)
         self._worker.step_update.connect(self._on_step_update)
         self._worker.file_done.connect(self._on_sync_file_done)
+        self._worker.backup_done.connect(self._on_backup_done)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.finished_err.connect(self._on_error)
         self._worker.start()
@@ -721,6 +777,8 @@ class MainWindow(QMainWindow):
         self._file_steps.clear()
         self._single_output_dir = ""
         self.open_folder_btn.hide()
+        self.open_backup_btn.hide()
+        self._backup_dir = ""
         self.details_area.clear()
         self.results_table.setRowCount(0)
         self.results_section.hide()
@@ -1067,6 +1125,14 @@ class MainWindow(QMainWindow):
     def _open_single_folder(self):
         if self._single_output_dir:
             self._open_folder(self._single_output_dir)
+
+    def _on_backup_done(self, wsl_path: str):
+        self._backup_dir = wsl_path
+        self.open_backup_btn.show()
+
+    def _open_backup_folder(self):
+        if self._backup_dir:
+            self._open_folder(self._backup_dir)
 
     # -- details panel ------------------------------------------------------
 

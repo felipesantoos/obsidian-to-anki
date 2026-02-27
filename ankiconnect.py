@@ -184,3 +184,7 @@ class AnkiConnectClient:
     def store_media_file(self, filename: str, path: str) -> None:
         """Store a media file in Anki's collection.media folder."""
         self._invoke("storeMediaFile", filename=filename, path=path)
+
+    def export_package(self, deck: str, path: str, include_sched: bool = True) -> bool:
+        """Export a deck to an .apkg file. Returns True on success."""
+        return self._invoke("exportPackage", deck=deck, path=path, includeSched=include_sched)
